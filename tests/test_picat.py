@@ -2,7 +2,7 @@ import base64
 
 import pytest
 
-from picat import cells, fit, graphics_commands, placeholders, preview_size, wrap_tmux
+from picat import cells, fit, graphics_commands, placeholders, wrap_tmux
 from picat.diacritics import DIACRITICS
 
 ESC = "\x1b"
@@ -22,10 +22,6 @@ def test_cells_round_up():
     assert cells((1501, 1001), cell_px=(10, 20)) == (151, 51)
 
 
-def test_preview_is_a_quarter_width_but_not_tiny():
-    assert preview_size((1600, 1000)) == (400, 250)
-    assert preview_size((400, 200)) == (256, 128)
-    assert preview_size((200, 100)) is None  # already small: no preview needed
 
 
 def test_graphics_commands_chunk_payload_and_mark_continuation():
@@ -65,36 +61,6 @@ def test_placeholders_reject_images_too_big_to_address():
         placeholders(image_id=1, cols=len(DIACRITICS) + 1, rows=1)
 
 
-def test_show_swaps_to_final_image_by_reprinting_placeholders(monkeypatch):
-    import io
-    import re
-
-    from PIL import Image
-
-    import picat
-
-    monkeypatch.setattr(picat, "terminal_geometry", lambda: (100, 40, 10, 20))
-    monkeypatch.delenv("TMUX", raising=False)
-    out = io.StringIO()
-    picat.show(Image.new("RGB", (2000, 1000)), out=out)
-    s = out.getvalue()
-
-    ids = [int(m) for m in re.findall(r"_Ga=T,[^;]*?i=(\d+)", s)]
-    assert len(ids) == 2 and ids[0] != ids[1]  # preview and final under different ids
-    preview_id, final_id = ids
-    colour = lambda i: f"\x1b[38;2;{(i >> 16) & 255};{(i >> 8) & 255};{i & 255}m"
-    # Order: preview data, placeholders for it, final data, cursor back up, final placeholders,
-    # then the preview image deleted.
-    p_preview = s.index(f"i={preview_id},")
-    p_ph1 = s.index(colour(preview_id))
-    p_final = s.index(f"i={final_id},")
-    p_ph2 = s.index(colour(final_id))
-    p_delete = s.index(f"_Ga=d,d=I,i={preview_id}")
-    assert p_preview < p_ph1 < p_final < p_ph2 < p_delete
-    up = re.search(r"\x1b\[(\d+)A\r", s[p_final:p_ph2])
-    assert up is not None
-    assert int(up.group(1)) == s[p_ph1:p_final].count("\n")  # back to the first placeholder row
-
 
 def test_placeholders_can_be_indented():
     s = placeholders(image_id=1, cols=2, rows=2, indent=3)
@@ -116,3 +82,96 @@ def test_show_centres_image_horizontally(monkeypatch):
     picat.show(Image.new("RGB", (400, 200)), out=out)  # 40x10 cells in a 100-column window
     first_row = out.getvalue().split(chr(0x10EEEE), 1)[0].rsplit("m", 1)[1]
     assert first_row == " " * 30
+
+
+def test_preview_sizes_are_a_sixteenth_then_a_quarter_of_the_width():
+    from picat import preview_sizes
+
+    assert preview_sizes((2000, 1000)) == [(126, 63), (500, 250)]  # 125 would round 62.5
+    assert preview_sizes((400, 200)) == [(100, 50)]  # 1/16 would be under 32 px wide
+    assert preview_sizes((100, 50)) == []
+
+
+def test_strips_cover_all_rows_on_cell_boundaries():
+    from picat import strips
+
+    s = strips(height=1000, nrows=50, count=10)
+    assert len(s) == 10
+    assert s[0][:3] == (0, 5, 0) and s[-1][1] == 50 and s[-1][3] == 1000
+    assert all(a[1] == b[0] and a[3] == b[2] for a, b in zip(s, s[1:]))
+    assert all(y0 == 20 * r0 for r0, _, y0, _ in s)  # 20 px per cell row
+
+
+def test_strips_never_more_than_cell_rows():
+    from picat import strips
+
+    assert len(strips(height=100, nrows=3, count=10)) == 3
+
+
+def test_progress_bar_shows_fraction_and_time_left():
+    from picat import progress_bar
+
+    bar = progress_bar(0.5, 1.25, width=20)
+    assert "50%" in bar and "1.2 s" in bar
+    assert bar.count("█") == 5 and bar.count("░") == 5  # 10 cells left for the bar itself
+
+
+def test_show_sends_tiny_then_preview_then_strips(monkeypatch):
+    import io
+    import re
+
+    from PIL import Image
+
+    import picat
+
+    monkeypatch.setattr(picat, "terminal_geometry", lambda: (100, 40, 10, 20))
+    monkeypatch.delenv("TMUX", raising=False)
+    out = io.StringIO()
+    picat.show(Image.new("RGB", (2000, 1000)), out=out)
+    s = out.getvalue()
+    grids = re.findall(r"_Ga=T,[^;]*?c=(\d+),r=(\d+)", s)
+    assert len({c for c, _ in grids}) == 1  # all stretched to one width in cells
+    assert len(grids) > 3  # two previews, then several strips
+    nrows = int(grids[0][1])
+    assert sum(int(r) for _, r in grids[2:]) == nrows  # strips tile the image's rows
+    assert s.count("_Ga=d,d=I") == 2  # both previews freed
+    assert s.rstrip().endswith("\x1b[2K") or "\x1b[2K" in s[-40:]  # progress bar cleared
+
+
+def test_every_image_matches_its_cell_box_so_strips_line_up(monkeypatch):
+    # kitty fits each image into its c x r box keeping the aspect ratio, centring it; any
+    # mismatch shifts that strip sideways and makes the image's edges jagged.
+    import io
+    import re
+
+    from PIL import Image
+
+    import picat
+
+    cw, ch = 9.4, 18.1
+    monkeypatch.setattr(picat, "terminal_geometry", lambda: (213, 57, cw, ch))
+    monkeypatch.delenv("TMUX", raising=False)
+    out = io.StringIO()
+    picat.show(Image.new("RGB", (3072, 2048), "red"), out=out)
+    s = out.getvalue()
+    starts = list(re.finditer(r"\x1b_Ga=T,[^;]*?c=(\d+),r=(\d+)", s))
+    assert len(starts) > 3
+    widths = []  # on screen, in pixels
+    for m in starts:
+        end = s.index("\x1b\\", s.index("m=0;", m.start()))
+        payload = "".join(re.findall(r";([A-Za-z0-9+/=]*)(?:\x1b\\|$)", s[m.start():end + 2]))
+        w, h = Image.open(io.BytesIO(base64.b64decode(payload))).size
+        c, r = int(m.group(1)), int(m.group(2))
+        widths.append(min(c * cw, w * r * ch / h))
+    previews, strip_widths = widths[:2], widths[2:]
+    assert max(strip_widths) - min(strip_widths) < 1
+    assert all(abs(p - strip_widths[0]) < 0.01 * strip_widths[0] for p in previews)
+
+
+def test_placeholder_row_names_that_row_in_every_cell():
+    from picat import placeholder_row
+
+    cell = chr(0x10EEEE)
+    s = placeholder_row(image_id=1, row=3, cols=4, indent=2)
+    body = s.split("m", 1)[1].rsplit("\x1b", 1)[0]
+    assert body == "  " + "".join(cell + chr(DIACRITICS[3]) + chr(DIACRITICS[c]) for c in range(4))
