@@ -84,12 +84,12 @@ def test_show_centres_image_horizontally(monkeypatch):
     assert first_row == " " * 30
 
 
-def test_preview_sizes_are_a_sixteenth_then_a_quarter_of_the_width():
+def test_preview_sizes_are_a_sixteenth_a_quarter_and_a_half_of_the_width():
     from picat import preview_sizes
 
-    assert preview_sizes((2000, 1000)) == [(126, 63), (500, 250)]  # 125 would round 62.5
-    assert preview_sizes((400, 200)) == [(100, 50)]  # 1/16 would be under 32 px wide
-    assert preview_sizes((100, 50)) == []
+    assert preview_sizes((2000, 1000)) == [(126, 63), (500, 250), (1000, 500)]  # 125 would round 62.5
+    assert preview_sizes((400, 200)) == [(100, 50), (200, 100)]  # 1/16 would be under 32 px wide
+    assert preview_sizes((60, 30)) == []
 
 
 def test_strips_cover_all_rows_on_cell_boundaries():
@@ -116,7 +116,7 @@ def test_progress_bar_shows_fraction_and_time_left():
     assert bar.count("█") == 5 and bar.count("░") == 5  # 10 cells left for the bar itself
 
 
-def test_show_sends_tiny_then_preview_then_strips(monkeypatch):
+def test_show_sends_three_previews_then_strips(monkeypatch):
     import io
     import re
 
@@ -131,10 +131,10 @@ def test_show_sends_tiny_then_preview_then_strips(monkeypatch):
     s = out.getvalue()
     grids = re.findall(r"_Ga=T,[^;]*?c=(\d+),r=(\d+)", s)
     assert len({c for c, _ in grids}) == 1  # all stretched to one width in cells
-    assert len(grids) > 3  # two previews, then several strips
+    assert len(grids) > 4  # three previews, then several strips
     nrows = int(grids[0][1])
-    assert sum(int(r) for _, r in grids[2:]) == nrows  # strips tile the image's rows
-    assert s.count("_Ga=d,d=I") == 2  # both previews freed
+    assert sum(int(r) for _, r in grids[3:]) == nrows  # strips tile the image's rows
+    assert s.count("_Ga=d,d=I") == 3  # all previews freed
     assert s.rstrip().endswith("\x1b[2K") or "\x1b[2K" in s[-40:]  # progress bar cleared
 
 
@@ -163,7 +163,7 @@ def test_every_image_matches_its_cell_box_so_strips_line_up(monkeypatch):
         w, h = Image.open(io.BytesIO(base64.b64decode(payload))).size
         c, r = int(m.group(1)), int(m.group(2))
         widths.append(min(c * cw, w * r * ch / h))
-    previews, strip_widths = widths[:2], widths[2:]
+    previews, strip_widths = widths[:3], widths[3:]
     assert max(strip_widths) - min(strip_widths) < 1
     assert all(abs(p - strip_widths[0]) < 0.01 * strip_widths[0] for p in previews)
 

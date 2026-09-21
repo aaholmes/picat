@@ -1,5 +1,5 @@
 """Show an image in kitty quickly over a slow connection, sized to fit the terminal window: a tiny
-preview (1/16 of the width) first, then a larger one (1/4), then the full-resolution image as
+preview (1/16 of the width) first, then larger ones (1/4 and 1/2), then the full-resolution image as
 horizontal strips, each a separate image replacing the preview where it lands. A progress bar below shows the time
 left.
 
@@ -44,11 +44,11 @@ def cells(size, cell_px):
 
 
 def preview_sizes(size, min_width=32):
-    """Previews at about 1/16 and 1/4 of the width, skipping any narrower than `min_width`. Each
+    """Previews at about 1/16, 1/4 and 1/2 of the width, skipping any narrower than `min_width`. Each
     width is nudged so that the rounded height keeps the aspect ratio as closely as possible."""
     w, h = size
     sizes = []
-    for d in (16, 4):
+    for d in (16, 4, 2):
         if w // d >= min_width:
             pw = min(range(w // d, w // d + 8), key=lambda x: abs(h * x / w - round(h * x / w)))
             sizes.append((pw, round(h * pw / w)))
@@ -207,7 +207,7 @@ def show(img, out=None, strip_count=24):
         out.write(f"{ESC}[{up}A\r" + placeholder_row(image_id, image_row, ncols, indent) + f"{ESC}[{up}B\r")
 
     b64 = lambda n: 4 * math.ceil(n / 3)
-    first = random.randint(1, 2**24 - 4 - strip_count)  # previews and strips take the ids after it
+    first = random.randint(1, 2**24 - 5 - strip_count)  # previews and strips take the ids after it
     grid = f"U=1,f=100,c={ncols},r={nrows},q=2"
     preview_ids, estimate = [], None  # estimate: bytes of the full image, from the latest preview
     for n, size in enumerate(preview_sizes(canvas), 1):
@@ -233,9 +233,9 @@ def show(img, out=None, strip_count=24):
     for j, (r0, r1, y0, y1) in enumerate(bands):
         data = encoded.get()
         strip_bytes.append(b64(len(data)))
-        send(data, f"a=T,i={first + 3 + j},U=1,f=100,c={ncols},r={r1 - r0},q=2")
+        send(data, f"a=T,i={first + 4 + j},U=1,f=100,c={ncols},r={r1 - r0},q=2")
         for row in range(r0, r1):
-            draw_row(first + 3 + j, row, row - r0)
+            draw_row(first + 4 + j, row, row - r0)
         left = len(bands) - j - 1
         bar(sent + left * sum(strip_bytes) / len(strip_bytes))
     for i in preview_ids:
