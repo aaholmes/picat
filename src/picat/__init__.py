@@ -1,12 +1,13 @@
 """Show an image in kitty quickly over a slow connection, sized to fit the terminal window: a tiny
 preview (1/16 of the width) first, then larger ones (1/4 and 1/2), then the full-resolution image as
-horizontal strips, each a separate image replacing the preview where it lands. A progress bar below shows the time
-left.
+horizontal strips, each a separate image replacing the preview where it lands.
 
 Uses kitty's graphics protocol with Unicode placeholders, so it also works inside tmux (which needs
 `set -g allow-passthrough on`).
 
-Usage: picat IMAGE        (or `picat -` to read the image from standard input)
+Usage: picat [--progress] IMAGE    (`-` reads the image from standard input)
+
+  --progress, -p   show a bar below the image with the time left
 """
 
 import base64
@@ -151,7 +152,7 @@ def small_png(img, size, offset):
     return png(canvas)
 
 
-def show(img, out=None, strip_count=24):
+def show(img, out=None, strip_count=24, progress=False):
     out = out or sys.stdout
     cols, rows, cw, ch = terminal_geometry()
     target = fit(img.size, (cols * cw, max(1, rows - 3) * ch))  # room for the bar and the prompt
@@ -197,6 +198,8 @@ def show(img, out=None, strip_count=24):
         out.flush()
 
     def bar(total):
+        if not progress:
+            return
         rate = sent / max(time.monotonic() - start, 1e-3)
         out.write("\r" + " " * indent + progress_bar(min(1, sent / total), max(0, total - sent) / rate, max(20, ncols)) + f"{ESC}[K")
         out.flush()
@@ -254,9 +257,12 @@ def show(img, out=None, strip_count=24):
 
 
 def main():
-    if len(sys.argv) != 2 or sys.argv[1] in ("-h", "--help"):
+    args = sys.argv[1:]
+    progress = bool({"--progress", "-p"} & set(args))
+    args = [a for a in args if a not in ("--progress", "-p")]
+    if len(args) != 1 or args[0] in ("-h", "--help"):
         sys.exit(__doc__.strip())
-    src = sys.stdin.buffer if sys.argv[1] == "-" else sys.argv[1]
+    src = sys.stdin.buffer if args[0] == "-" else args[0]
     img = Image.open(src)
     img = img.convert("RGBA" if "A" in img.getbands() else "RGB")
-    show(img)
+    show(img, progress=progress)

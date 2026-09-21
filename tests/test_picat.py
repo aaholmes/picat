@@ -175,3 +175,30 @@ def test_placeholder_row_names_that_row_in_every_cell():
     s = placeholder_row(image_id=1, row=3, cols=4, indent=2)
     body = s.split("m", 1)[1].rsplit("\x1b", 1)[0]
     assert body == "  " + "".join(cell + chr(DIACRITICS[3]) + chr(DIACRITICS[c]) for c in range(4))
+
+
+@pytest.mark.parametrize("progress", [False, True])
+def test_progress_bar_only_when_asked(monkeypatch, progress):
+    import io
+
+    from PIL import Image
+
+    import picat
+
+    monkeypatch.setattr(picat, "terminal_geometry", lambda: (100, 40, 10, 20))
+    monkeypatch.delenv("TMUX", raising=False)
+    out = io.StringIO()
+    picat.show(Image.new("RGB", (2000, 1000)), out=out, progress=progress)
+    assert ("░" in out.getvalue()) == progress
+
+
+def test_main_reads_progress_flag(monkeypatch):
+    import picat
+
+    seen = {}
+    monkeypatch.setattr(picat, "show", lambda img, progress=False: seen.update(progress=progress))
+    monkeypatch.setattr(picat.Image, "open", lambda src: __import__("PIL.Image").Image.new("RGB", (4, 4)))
+    for argv, want in ((["picat", "x.png"], False), (["picat", "--progress", "x.png"], True)):
+        monkeypatch.setattr("sys.argv", argv)
+        picat.main()
+        assert seen["progress"] is want

@@ -3,13 +3,14 @@
 Shows an image in the [kitty](https://sw.kovidgoyal.net/kitty/) terminal quickly over a slow
 connection, such as ssh. A tiny preview (1/16 of the width) appears almost at once, then sharper
 ones (1/4 and 1/2 of the width), all stretched to the final size. The full-resolution image then arrives in
-horizontal strips, each replacing the preview where it lands, while a bar below shows the time
-left. The image is scaled to fit the terminal window, so no more pixels are sent than can be shown.
+horizontal strips, each replacing the preview where it lands (`--progress` adds a bar below showing
+the time left). The image is scaled to fit the terminal window, so no more pixels are sent than can be shown.
 
 ```sh
 uv tool install -e .     # installs the `picat` command
 picat image.png
 some-command | picat -
+picat --progress image.png
 ```
 
 It works inside tmux, using kitty's Unicode placeholders (text cells that tmux treats as ordinary
