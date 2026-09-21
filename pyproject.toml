@@ -1,0 +1,23 @@
+[project]
+name = "picat"
+version = "0.1.0"
+description = "Progressive image display for kitty: a fast preview first, then full resolution"
+authors = [
+    { name = "Adam A Holmes", email = "adamaholmes@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "pillow>=12.3.0",
+]
+
+[project.scripts]
+picat = "picat:main"
+
+[build-system]
+requires = ["uv_build>=0.11.8,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
