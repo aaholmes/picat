@@ -17,13 +17,21 @@ characters and kitty draws the image over), provided tmux has `set -g allow-pass
 
 ## Compared with `kitten icat`
 
-![Seconds until the first preview and the whole image appear, for picat and icat](docs/benchmark.png)
+Both programs ran in a 2000×1416-pixel terminal, with their output read at 10 Mbit/s, on a photo
+and on a generated image (a 3×2 grid of 1024×1024 images), each at three sizes. Images wider than
+2000 pixels are shrunk to 2000×1283 (photo) or 2000×1333 (generated) by both. Times are the
+median of 3 runs, which differed by under 0.02 s.
 
-Both programs ran in a 2000×1416-pixel terminal, with their output read at 10 Mbit/s, on a
-generated image (a 3×2 grid of 1024×1024 images) and on a photo, each at three sizes. The spread
-over 3 runs is under 0.02 s, too small to see. picat shows a preview within 0.2 s at every size;
-icat shows nothing until the whole image has arrived.
+| Image | First pixels, icat | First pixels, picat | Full image, icat | Full image, picat | Sent, icat | Sent, picat |
+|---|---|---|---|---|---|---|
+| Photo 1562×1002 | 0.45 s | 0.04 s | 0.51 s | 0.74 s | 0.54 MB | 0.85 MB |
+| Photo 3125×2005 | 0.88 s | 0.07 s | 0.97 s | 1.31 s | 0.96 MB | 1.52 MB |
+| Photo 6250×4010 | 1.07 s | 0.15 s | 1.17 s | 1.52 s | 1.05 MB | 1.68 MB |
+| Generated 768×512 | 0.87 s | 0.04 s | 0.89 s | 1.09 s | 1.06 MB | 1.26 MB |
+| Generated 1536×1024 | 3.13 s | 0.08 s | 3.19 s | 3.78 s | 3.86 MB | 4.52 MB |
+| Generated 3072×2048 | 7.89 s | 0.18 s | 7.98 s | 6.19 s | 9.30 MB | 7.34 MB |
 
+icat's first pixels are its whole image, since it draws nothing until all the data has arrived.
 The whole image usually arrives 0.2–0.6 s later with picat, because its three previews add
 13–50% to the data sent. It arrives sooner only for the largest generated image, which both
 programs must shrink to fit the window. There icat sends raw pixels compressed with zlib, while
