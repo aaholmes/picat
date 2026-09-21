@@ -209,12 +209,21 @@ def show(img, out=None, strip_count=24):
     b64 = lambda n: 4 * math.ceil(n / 3)
     first = random.randint(1, 2**24 - 5 - strip_count)  # previews and strips take the ids after it
     grid = f"U=1,f=100,c={ncols},r={nrows},q=2"
+    # Previews are also made in the background, so each is prepared while the one before is sent.
+    sizes = preview_sizes(canvas)
+    previews = queue.Queue()
+
+    def make_previews():
+        for size in sizes:
+            k = size[0] / canvas[0]
+            inner = max(1, round(target[0] * k)), max(1, round(target[1] * k))
+            small = img.resize(inner, Image.LANCZOS, reducing_gap=3.0)
+            previews.put((k, small_png(small, size, (round(offset[0] * k), round(offset[1] * k)))))
+
+    threading.Thread(target=make_previews, daemon=True).start()
     preview_ids, estimate = [], None  # estimate: bytes of the full image, from the latest preview
-    for n, size in enumerate(preview_sizes(canvas), 1):
-        k = size[0] / canvas[0]
-        inner = max(1, round(target[0] * k)), max(1, round(target[1] * k))
-        small = img.resize(inner, Image.LANCZOS, reducing_gap=3.0)
-        data = small_png(small, size, (round(offset[0] * k), round(offset[1] * k)))
+    for n in range(1, len(sizes) + 1):
+        k, data = previews.get()
         send(data, f"a=T,i={first + n},{grid}")
         preview_ids.append(first + n)
         estimate = b64(len(data)) / k**2
