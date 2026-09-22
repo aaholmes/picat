@@ -198,7 +198,7 @@ def test_previews_are_placed_under_the_image_and_deleted_when_done(monkeypatch):
     assert s.rindex("_Ga=d,d=I") > s.rindex("a=f,")  # the last only once the strips are in
 
 
-def test_the_image_and_previews_have_the_shape_of_the_box_and_strips_fill_the_picture(monkeypatch):
+def test_the_image_and_previews_keep_the_box_aspect_ratio_and_strips_fill_the_picture(monkeypatch):
     cw, ch = 9.4, 18  # kitty's cells are whole pixels; only a guessed size can be fractional
     sent = transmissions(run_show(monkeypatch, geometry=(213, 57, cw, ch)))
     for k, (w, h) in [x for x in sent if x[0]["a"] == "T"]:

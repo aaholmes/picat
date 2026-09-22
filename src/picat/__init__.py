@@ -1,8 +1,8 @@
 """Show an image in kitty quickly over a slow connection, sized to fit the terminal window: a tiny
-preview (1/16 of the width) first, then larger ones (1/4 and 1/2), then the full-resolution image as
-horizontal strips, the most detailed parts first. The prompt returns
-once the first preview is on screen; the rest loads in the background, a little slower than the
-link's measured rate so that typing stays responsive, and stops if another command is run.
+preview (1/16 of the width) first, then larger ones (1/4 and 1/2), then the full-resolution image
+as horizontal strips, the most detailed parts first. The prompt returns once the first preview is
+on screen; the rest loads in the background, a little slower than the link's measured rate so that
+typing stays responsive, and stops if another command is run.
 
 Uses kitty's graphics protocol with Unicode placeholders, so it also works inside tmux (which needs
 `set -g allow-passthrough on`).
@@ -298,13 +298,10 @@ def show(img, out=None, strip_count=24, progress=False, detach=False, stop=lambd
     indent = (cols - ncols) // 2  # centred, as icat does
     wrap = wrap_tmux if os.environ.get("TMUX") else (lambda s: s)
 
-    # The first preview is shown through placeholder text, written once. Everything after it is
-    # placed relative to that (kitty keeps such placements in step with the text as it scrolls),
-    # so the image can improve without touching the text, while the shell uses the terminal.
-    # Placeholder images keep their aspect ratio inside their box of cells, while relative
-    # placements given a size in cells are stretched to fill it, so previews are padded to exactly
-    # the box's shape; the full-resolution strips are placed at their natural pixel size instead.
-    # Each cell row is a whole number of image pixels, so strips need no scaling.
+    # kitty fits an image into its box of cells keeping its aspect ratio, so the image sent is
+    # padded to the box's exact aspect ratio, with the picture centred on a transparent
+    # background. Each cell row is then a whole number of pixels tall, which also lets a strip
+    # cover whole cell rows; the image is scaled by the (tiny) factor this rounding needs.
     k = max(1, round(ch)) / ch
     target = max(1, round(target[0] * k)), max(1, round(target[1] * k))
     box = round(ncols * cw * k), nrows * max(1, round(ch))
@@ -346,9 +343,9 @@ def show(img, out=None, strip_count=24, progress=False, detach=False, stop=lambd
     # full-resolution strips are written as frame edits (kitty redraws those); placeholder text is
     # cropped by tmux, and scrolls, like any other text. The previews are separate images placed
     # relative to it, underneath (negative z), so each strip covers them as it lands; the last is
-    # deleted once the strips are in, or when loading stops. A placed image is not cropped by tmux
-    # and follows the topmost row of its parent still on screen, so previews shown after a
-    # stopped or finished load would be out of place.
+    # deleted once the strips are in, or when loading stops. Such a placed image is not cropped by
+    # tmux when a pane is resized, and follows the topmost row of its parent still on screen, so a
+    # preview left behind after a load ended would end up in the wrong place.
     parent = random.randint(1, 2**24 - 5)  # the previews take the ids after it
     grid = f"c={ncols},r={nrows}"
     below = f"p=1,P={parent},Q=1,H=0,V=0,C=1"  # placed relative to the image
@@ -367,7 +364,7 @@ def show(img, out=None, strip_count=24, progress=False, detach=False, stop=lambd
     quiet = "q=0" if detach and not rate else "q=2"  # q=0: kitty replies OK once it has the whole image
 
     try:
-        if sizes:  # transparent, and exactly the box's shape, as kitty keeps the aspect ratio
+        if sizes:  # transparent, and the box's exact aspect ratio, which kitty keeps
             send(png(Image.new("RGBA", box)), f"a=T,U=1,f=100,i={parent},p=1,{grid},q=2")
         else:  # small enough to send whole
             final = img if img.size == target else img.resize(target, Image.LANCZOS)

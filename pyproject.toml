@@ -1,7 +1,7 @@
 [project]
 name = "picat"
 version = "0.1.0"
-description = "Progressive image display for kitty: a fast preview first, then full resolution"
+description = "Async image display over a slow ssh connection: immediate low-res preview, with full resolution loading in the background. For the kitty terminal, works in tmux."
 authors = [
     { name = "Adam A Holmes", email = "adamaholmes@gmail.com" }
 ]
