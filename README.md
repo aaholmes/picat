@@ -47,20 +47,20 @@ Both programs ran in a 2000×1416-pixel terminal, with their output read at 10 M
 and on a generated image (a 3×2 grid of 1024×1024 images), each at three sizes. Images wider than
 2000 pixels are shrunk to 2000×1283 (photo) or 2000×1333 (generated) by both. picat already knew
 the link's rate, so it returned the prompt without waiting for acknowledgements. Times are the
-median of 3 runs, which differed by at most 0.05 s.
+median of 3 runs, which differed by at most 0.10 s.
 
 | Image | Full image, icat | First pixels, picat | Prompt back, picat | Full image, picat | Sent, icat | Sent, picat |
 |---|---|---|---|---|---|---|
-| Photo 1562×1002 | 0.51 s | 0.04 s | 0.09 s | 0.62 s | 0.54 MB | 0.67 MB |
-| Photo 3125×2005 | 0.97 s | 0.07 s | 0.14 s | 1.14 s | 0.96 MB | 1.22 MB |
-| Photo 6250×4010 | 1.17 s | 0.15 s | 0.23 s | 1.38 s | 1.05 MB | 1.38 MB |
-| Generated 768×512 | 0.89 s | 0.05 s | 0.05 s | 1.10 s | 1.06 MB | 1.21 MB |
-| Generated 1536×1024 | 3.23 s | 0.08 s | 0.12 s | 3.91 s | 3.86 MB | 4.34 MB |
-| Generated 3072×2048 | 8.04 s | 0.18 s | 0.25 s | 6.41 s | 9.30 MB | 7.03 MB |
+| Photo 1562×1002 | 0.51 s | 0.06 s | 0.11 s | 0.64 s | 0.53 MB | 0.68 MB |
+| Photo 3125×2005 | 0.98 s | 0.10 s | 0.18 s | 1.18 s | 0.96 MB | 1.25 MB |
+| Photo 6250×4010 | 1.18 s | 0.17 s | 0.30 s | 1.41 s | 1.05 MB | 1.40 MB |
+| Generated 768×512 | 0.89 s | 0.05 s | 0.06 s | 1.11 s | 1.06 MB | 1.21 MB |
+| Generated 1536×1024 | 3.20 s | 0.09 s | 0.14 s | 3.93 s | 3.86 MB | 4.35 MB |
+| Generated 3072×2048 | 8.03 s | 0.20 s | 0.29 s | 6.45 s | 9.30 MB | 7.06 MB |
 
 icat draws nothing until all the data has arrived, and returns the prompt then. With picat the
-whole image usually arrives 0.1–0.7 s later than with icat, because its three previews add roughly
-15–50% to the data sent, and the rest is sent at 90% of the link's rate. It arrives sooner only for
+whole image usually arrives 0.1–0.7 s later than with icat, because its three previews add
+11–36% to the data sent, and the rest is sent at 90% of the link's rate. It arrives sooner only for
 the largest generated image, which both programs must shrink to fit the window. There icat sends
 raw pixels compressed with zlib, while picat sends PNG, which first predicts each pixel from its
 neighbours and compresses only the difference; on a smooth generated image that makes the data
