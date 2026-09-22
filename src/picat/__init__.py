@@ -82,14 +82,16 @@ def progress_bar(fraction, seconds_left, width):
     return "█" * filled + "░" * (n - filled) + text
 
 
-def graphics_commands(data, control):
-    """Split `data` into kitty graphics protocol escape sequences carrying `control` keys."""
+def graphics_commands(data, control, repeat=False):
+    """Split `data` into kitty graphics protocol escape sequences carrying `control` keys: in the
+    first only, or with `repeat` in every one (kitty 0.32 loses a chunked frame edit's position
+    otherwise)."""
     b64 = base64.b64encode(data).decode()
     chunks = [b64[i:i + CHUNK] for i in range(0, len(b64), CHUNK)] or [""]
     cmds = []
     for n, chunk in enumerate(chunks):
         more = int(n < len(chunks) - 1)
-        keys = f"{control},m={more}" if n == 0 else f"m={more}"
+        keys = f"{control},m={more}" if n == 0 or repeat else f"m={more}"
         cmds.append(f"{ESC}_G{keys};{chunk}{ESC}\\")
     return cmds
 
@@ -313,9 +315,9 @@ def show(img, out=None, strip_count=24, progress=False, detach=False, stop=lambd
 
     sent, start, pacer = 0, time.monotonic(), None
 
-    def send(data, control):
+    def send(data, control, repeat=False):
         nonlocal sent
-        for n, cmd in enumerate(graphics_commands(data, control)):
+        for n, cmd in enumerate(graphics_commands(data, control, repeat)):
             if stop():  # checked before every chunk, so the terminal is freed within one chunk
                 if n:  # end this image's chunks, so kitty is ready for another program's image
                     out.write(wrap(f"{ESC}_Gm=0;{ESC}\\"))
@@ -340,14 +342,16 @@ def show(img, out=None, strip_count=24, progress=False, detach=False, stop=lambd
         small = img.resize(inner, Image.LANCZOS, reducing_gap=3.0)
         return s, small_png(small, size, (round(offset[0] * s), round(offset[1] * s)))
 
-    # The only placeholder text is the image's bottom row, the parent, and every stage is placed
-    # relative to it, reaching up over the rows above. kitty positions such a parent by its
-    # topmost row still on screen, so a taller parent would shift everything once its top had
-    # scrolled off; the bottom row is on screen for as long as any of the image is.
-    parent = random.randint(1, 2**24 - 5 - strip_count)  # later stages take the ids after it
+    # The finished image is one placeholder image, starting transparent, into which the
+    # full-resolution strips are written as frame edits (kitty redraws those); placeholder text is
+    # cropped by tmux, and scrolls, like any other text. The previews are separate images placed
+    # relative to it, underneath (negative z), so each strip covers them as it lands; the last is
+    # deleted once the strips are in, or when loading stops. A placed image is not cropped by tmux
+    # and follows the topmost row of its parent still on screen, so previews shown after a
+    # stopped or finished load would be out of place.
+    parent = random.randint(1, 2**24 - 5)  # the previews take the ids after it
     grid = f"c={ncols},r={nrows}"
-    top = 1 - nrows  # the image's top row, relative to the parent
-    below = f"p=1,P={parent},Q=1,H=0,C=1"  # placed relative to the parent
+    below = f"p=1,P={parent},Q=1,H=0,V=0,C=1"  # placed relative to the image
     restore = None
     # A rate measured recently on this link is reused: then nothing needs to be read from the
     # terminal, and the prompt returns as soon as the first preview is sent.
@@ -363,29 +367,27 @@ def show(img, out=None, strip_count=24, progress=False, detach=False, stop=lambd
     quiet = "q=0" if detach and not rate else "q=2"  # q=0: kitty replies OK once it has the whole image
 
     try:
-        # Transparent, and exactly the row's shape: kitty draws a placeholder image centred in its
-        # cells keeping its aspect ratio, and places the stages relative to where it is drawn.
-        row = Image.new("RGBA", (box[0], box[1] // nrows))
-        send(png(row), f"a=T,U=1,f=100,i={parent},p=1,c={ncols},r=1,q=2")
-        out.write("\n" * (nrows - 1) + placeholders(parent, ncols, 1, indent) + "\n")
-        out.flush()
-        if sizes:
-            data = preview(sizes[0])[1]
+        if sizes:  # transparent, and exactly the box's shape, as kitty keeps the aspect ratio
+            send(png(Image.new("RGBA", box)), f"a=T,U=1,f=100,i={parent},p=1,{grid},q=2")
         else:  # small enough to send whole
-            data = png(pad(img if img.size == target else img.resize(target, Image.LANCZOS), box, offset))
-        before, t0 = sent, time.monotonic()  # time the link only, not preparing the image
-        send(data, f"a=T,f=100,i={parent + 1},V={top},{grid},z=1,{below},{quiet}")
+            final = img if img.size == target else img.resize(target, Image.LANCZOS)
+            send(png(pad(final, box, offset)), f"a=T,U=1,f=100,i={parent},p=1,{grid},q=2")
+        out.write(placeholders(parent, ncols, nrows, indent) + "\n")
+        out.flush()
         if not sizes:
             return
-        shown, later = parent + 1, list(enumerate(sizes))[1:]
+        data = preview(sizes[0])[1]
+        before, t0 = sent, time.monotonic()  # time the link only, not preparing the image
+        send(data, f"a=T,f=100,i={parent + 1},{grid},z=-3,{below},{quiet}")
+        shown, later = [parent + 1], list(enumerate(sizes))[1:]  # the preview on screen
         if detach and not rate:
             first = (sent - before, time.monotonic() - t0) if reply(parent + 1) else None
             s, data = preview(sizes[1])
             before, t0 = sent, time.monotonic()
-            send(data, f"a=T,f=100,i={parent + 2},V={top},{grid},z=2,{below},q=0")
+            send(data, f"a=T,f=100,i={parent + 2},{grid},z=-2,{below},q=0")
             second = (sent - before, time.monotonic() - t0) if reply(parent + 2) else None
-            out.write(wrap(f"{ESC}_Ga=d,d=I,i={shown},q=2{ESC}\\"))  # the new preview covers it
-            shown, later = parent + 2, later[1:]
+            out.write(wrap(f"{ESC}_Ga=d,d=I,i={shown[0]},q=2{ESC}\\"))  # the new preview covers it
+            shown[0], later = parent + 2, later[1:]
             log(f"replies {first} {second}")
             if first and second:
                 rate = estimate_rate(first, second)
@@ -411,9 +413,13 @@ def show(img, out=None, strip_count=24, progress=False, detach=False, stop=lambd
         pacer = Pacer(0.9 * rate)
     try:
         try:
-            ended = rest(img, out, send, bar, preview, later, shown, bands, target, offset, parent, grid, below, top)
+            ended = rest(img, out, send, bar, preview, later, shown, bands, target, offset, parent, grid, below)
         except Stopped:
             ended = "stopped for a command"
+            # A preview left behind would not be cropped by tmux, nor follow scrolling; without
+            # it, the strips sent so far stay, on a transparent background.
+            out.write(wrap(f"{ESC}_Ga=d,d=I,i={shown[0]},q=2{ESC}\\"))
+            out.flush()
         log(f"{ended} after {time.monotonic() - start:.2f} s, {sent} bytes")
     finally:
         if progress:
@@ -423,43 +429,40 @@ def show(img, out=None, strip_count=24, progress=False, detach=False, stop=lambd
             os._exit(0)
 
 
-def rest(img, out, send, bar, preview, later, shown, bands, target, offset, parent, grid, below, top):
+def rest(img, out, send, bar, preview, later, shown, bands, target, offset, parent, grid, below):
     """Everything still to send: the remaining previews, as (index, size), then the
-    full-resolution strips. Images are prepared in background threads while earlier ones are
-    sent."""
+    full-resolution strips, written into the image and covering only the picture's own rows.
+    `shown[0]` is kept as the preview on screen. Images are prepared in background threads while
+    earlier ones are sent."""
     wrap = wrap_tmux if os.environ.get("TMUX") else (lambda s: s)
     b64 = lambda n: 4 * math.ceil(n / 3)
+    ox, oy = offset
+    rows = [(max(y0, oy), min(y1, oy + target[1])) for _, _, y0, y1 in bands]
+    rows = [(y0, y1) for y0, y1 in rows if y1 > y0]
     encoded, previews = queue.Queue(), queue.Queue()
 
     def encode():
         final = img if img.size == target else img.resize(target, Image.LANCZOS)
-        oy = offset[1]
-        for _, _, y0, y1 in bands:
-            if oy <= y0 and y1 <= oy + target[1]:  # no padding in this strip, so no alpha needed
-                encoded.put(png(final.crop((0, y0 - oy, target[0], y1 - oy))))
-            else:
-                encoded.put(png(pad(final.crop((0, max(0, y0 - oy), target[0], min(target[1], y1 - oy))),
-                                    (target[0], y1 - y0), (0, max(0, oy - y0)))))
+        for y0, y1 in rows:
+            encoded.put(png(final.crop((0, y0 - oy, target[0], y1 - oy))))
 
     threading.Thread(target=lambda: [previews.put(preview(size)) for _, size in later], daemon=True).start()
     threading.Thread(target=encode, daemon=True).start()
 
     for n, _ in later:
         s, data = previews.get()
-        send(data, f"a=T,f=100,i={parent + 1 + n},V={top},{grid},z={1 + n},{below},q=2")
-        if shown:  # the new preview now covers it
-            out.write(wrap(f"{ESC}_Ga=d,d=I,i={shown},q=2{ESC}\\"))
-        shown = parent + 1 + n
+        send(data, f"a=T,f=100,i={parent + 1 + n},{grid},z={n - 3},{below},q=2")
+        out.write(wrap(f"{ESC}_Ga=d,d=I,i={shown[0]},q=2{ESC}\\"))  # the new preview covers it
+        shown[0] = parent + 1 + n
         bar(b64(len(data)) / s**2)  # the full image, judged from this preview
 
     strip_bytes = []
-    for j, (r0, r1, y0, y1) in enumerate(bands):
+    for j, (y0, y1) in enumerate(rows):
         data = encoded.get()
         strip_bytes.append(b64(len(data)))
-        send(data, f"a=T,f=100,i={parent + 4 + j},V={top + r0},X={offset[0]},z=10,{below},q=2")
-        bar((len(bands) - j - 1) * sum(strip_bytes) / len(strip_bytes))
-    if shown:
-        out.write(wrap(f"{ESC}_Ga=d,d=I,i={shown},q=2{ESC}\\"))
+        send(data, f"a=f,r=1,X=1,f=100,i={parent},x={ox},y={y0},q=2", repeat=True)  # X=1: replace
+        bar((len(rows) - j - 1) * sum(strip_bytes) / len(strip_bytes))
+    out.write(wrap(f"{ESC}_Ga=d,d=I,i={shown[0]},q=2{ESC}\\"))
     out.flush()
     return "finished"
 

@@ -146,14 +146,14 @@ def run_show(monkeypatch, geometry=(213, 57, 9.4, 18.1), size=(3072, 2048), imag
 
 
 def transmissions(s):
-    """(control keys, decoded image size) for each image sent."""
+    """(control keys, decoded image size) for each image or frame edit sent."""
     import io
     import re
 
     from PIL import Image
 
     found = []
-    for m in re.finditer(r"\x1b_G(a=T,[^;]*);", s):
+    for m in re.finditer(r"\x1b_G(a=[Tf],[^;]*);", s):
         end = s.index("\x1b\\", s.index("m=0;", m.start()))
         payload = "".join(re.findall(r";([A-Za-z0-9+/=]*)(?:\x1b\\|$)", s[m.start():end + 2]))
         keys = dict(kv.split("=") for kv in m.group(1).split(",") if kv != "m=1" and kv != "m=0")
@@ -169,46 +169,64 @@ def test_placeholder_text_is_written_once_with_no_cursor_movement(monkeypatch):
     assert not re.search(r"\x1b\[\d+[AB]", s)
 
 
-def test_only_the_bottom_row_is_placeholder_text_and_everything_is_placed_above_it(monkeypatch):
-    # kitty positions a placeholder parent by its topmost row still on screen, so a parent taller
-    # than one row would shift its children once its top scrolled off. The bottom row is the last
-    # to scroll off, so it is the parent, and every stage is placed relative to it.
+def test_the_finished_image_is_placeholder_text_filled_in_by_frame_edits(monkeypatch):
+    # Placeholder text is cropped by tmux like any other text, and scrolls with it, so the
+    # finished image is one placeholder image; the strips are written into it.
     s = run_show(monkeypatch)
     sent = transmissions(s)
-    (parent, _), rest = sent[0], sent[1:]
-    assert parent["U"] == "1" and parent["p"] == "1" and parent["r"] == "1"
-    assert s.count("\n", 0, s.index("\x1b[38;2;")) >= 1  # blank rows above the parent's row
-    assert all(k["P"] == parent["i"] and k["Q"] == "1" and "U" not in k for k, _ in rest)
-    previews = [k for k, _ in rest if "c" in k]
-    strips = [k for k, _ in rest if "c" not in k]
-    nrows = int(previews[0]["r"])
-    assert len(previews) == 3 and all(k["c"] == parent["c"] and int(k["V"]) == 1 - nrows for k in previews)
-    vs = [int(k["V"]) for k in strips]
-    assert vs[0] == 1 - nrows and vs == sorted(vs) and len(strips) > 1
+    (image, _), rest = sent[0], sent[1:]
+    assert image["a"] == "T" and image["U"] == "1"
+    strips = [k for k, _ in rest if k["a"] == "f"]
+    assert strips and all(k["i"] == image["i"] and k["r"] == "1" for k in strips)
+    ys = [int(k["y"]) for k in strips]
+    assert ys == sorted(ys)
 
 
-def test_each_preview_is_deleted_once_covered_and_the_last_once_the_strips_are_in(monkeypatch):
+def test_previews_are_placed_under_the_image_and_deleted_when_done(monkeypatch):
     import re
 
     s = run_show(monkeypatch)
     sent = transmissions(s)
+    image = sent[0][0]
+    previews = [k for k, _ in sent[1:] if k["a"] == "T"]
+    assert len(previews) == 3
+    assert all(k["P"] == image["i"] and int(k["z"]) < 0 and k["c"] == image["c"] and k["r"] == image["r"] for k in previews)
+    assert [int(k["z"]) for k in previews] == sorted(int(k["z"]) for k in previews)  # newer on top
     deleted = re.findall(r"_Ga=d,d=I,i=(\d+)", s)
-    assert sorted(deleted) == sorted(k["i"] for k, _ in sent[1:4])
+    assert sorted(deleted) == sorted(k["i"] for k in previews)
+    assert s.rindex("_Ga=d,d=I") > s.rindex("a=f,")  # the last only once the strips are in
 
 
-def test_previews_have_the_shape_of_the_box_and_strips_their_natural_size(monkeypatch):
+def test_the_image_and_previews_have_the_shape_of_the_box_and_strips_fill_the_picture(monkeypatch):
     cw, ch = 9.4, 18  # kitty's cells are whole pixels; only a guessed size can be fractional
     sent = transmissions(run_show(monkeypatch, geometry=(213, 57, cw, ch)))
-    previews, strips = sent[1:4], sent[4:]
-    for k, (w, h) in previews:
+    for k, (w, h) in [x for x in sent if x[0]["a"] == "T"]:
         box = int(k["c"]) * cw / (int(k["r"]) * ch)
         assert abs(w / h - box) < 0.01 * box
+    (image, (bw, bh)) = sent[0]
+    strips = [(k, size) for k, size in sent if k["a"] == "f"]
     width = strips[0][1][0]
-    assert all(size[0] == width for _, size in strips)
-    ncols, nrows = int(previews[0][0]["c"]), int(previews[0][0]["r"])
-    for k, (w, h) in strips:
-        assert abs(int(k["X"]) - (ncols * cw - w) / 2) <= 1 and int(k["X"]) < cw
-    assert sum(h for _, (w, h) in strips) == nrows * round(ch)
+    x0 = int(strips[0][0]["x"])
+    assert all(size[0] == width and int(k["x"]) == x0 for k, size in strips)
+    assert abs(x0 - (bw - width) / 2) <= 1
+    ys = [(int(k["y"]), int(k["y"]) + size[1]) for k, size in strips]
+    assert all(a[1] == b[0] for a, b in zip(ys, ys[1:]))  # strips tile the picture
+    assert ys[0][0] + ys[-1][1] in (bh - 1, bh, bh + 1)  # centred vertically
+
+
+def test_stopping_deletes_the_preview_on_show(monkeypatch):
+    import re
+
+    calls = []
+
+    def stop():
+        calls.append(1)
+        return len(calls) > 8  # during the previews
+
+    s = run_show(monkeypatch, stop=stop)
+    sent = transmissions(s)
+    previews = [k["i"] for k, _ in sent[1:] if k["a"] == "T"]
+    assert previews and re.findall(r"_Ga=d,d=I,i=(\d+)", s)[-1] == previews[-1]
 
 
 def test_main_detaches_unless_showing_progress(monkeypatch):
@@ -332,15 +350,22 @@ def test_one_reply_is_enough_to_carry_on_in_the_background(monkeypatch):
 
 def chunks_never_interleave(s):
     """kitty takes an image's chunks in sequence: after a chunk marked m=1, the next graphics
-    command must be that image's next chunk (no a= key), until one marked m=0."""
+    command must be that image's next chunk (no keys, or the same keys repeated), until one
+    marked m=0."""
     import re
 
-    open_ = False
+    current = None  # the keys of the transmission in progress
     for keys in re.findall(r"\x1b_G([^;\x1b]*)[;\x1b]", s):
-        if keys.startswith("a=") == open_:  # a new command while one is open, or a stray chunk
-            return False
-        open_ = "m=1" in keys
-    return not open_
+        base = keys.rsplit(",m=", 1)[0] if keys.startswith("a=") else None
+        if current is None:
+            if base is None:
+                return False  # a stray chunk
+            current = base
+        elif base is not None and base != current:
+            return False  # a new command while one is open
+        if "m=1" not in keys:
+            current = None
+    return current is None
 
 
 def test_stopping_mid_image_closes_that_image_first(monkeypatch):
@@ -408,10 +433,24 @@ def test_detached_show_remembers_the_rate_it_measured(monkeypatch):
     assert load_rate(rate_cache(), "192.0.2.1", now=time.time()) > 0
 
 
-def test_the_parent_row_image_has_the_shape_of_its_row(monkeypatch):
-    # kitty keeps a placeholder image's aspect ratio, centring it in its cells, and places the
-    # stages relative to where it is drawn: a square parent would push them to the right.
-    cw, ch = 9.4, 18
-    (parent, (w, h)), *_ = transmissions(run_show(monkeypatch, geometry=(213, 57, cw, ch)))
-    row = int(parent["c"]) * cw / ch
-    assert abs(w / h - row) < 0.01 * row
+def test_frame_edit_chunks_each_carry_the_full_keys():
+    # kitty 0.32 loses a chunked frame edit's position unless every chunk repeats it.
+    data = bytes(range(256)) * 40
+    cmds = graphics_commands(data, "a=f,r=1,i=7,x=3,y=40", repeat=True)
+    assert len(cmds) == 4
+    assert all(c.startswith(f"{ESC}_Ga=f,r=1,i=7,x=3,y=40,m=") for c in cmds)
+    payload = "".join(c.split(";", 1)[1][:-2] for c in cmds)
+    assert base64.b64decode(payload) == data
+
+
+def test_show_repeats_the_keys_in_every_chunk_of_a_frame_edit(monkeypatch):
+    import os
+    import re
+
+    from PIL import Image
+
+    noise = Image.frombytes("RGB", (1536, 1024), os.urandom(1536 * 1024 * 3))
+    s = run_show(monkeypatch, image=noise)
+    chunks = re.findall(r"\x1b_G([^;]*);", s)
+    after_edit = [k for prev, k in zip(chunks, chunks[1:]) if prev.startswith("a=f") and "m=1" in prev]
+    assert after_edit and all(k.startswith("a=f") for k in after_edit)
