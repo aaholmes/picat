@@ -3,8 +3,9 @@
 Shows an image in the [kitty](https://sw.kovidgoyal.net/kitty/) terminal quickly over a slow
 connection, such as ssh. A tiny preview (1/16 of the width) appears almost at once, then sharper
 ones (1/4 and 1/2 of the width), all stretched to the final size. The full-resolution image then
-arrives in horizontal strips, each covering the preview where it lands. The image is scaled to fit
-the terminal window, so no more pixels are sent than can be shown.
+arrives in horizontal strips, each covering the preview where it lands, the most detailed parts
+first, so that an interrupted load leaves the parts that gain most from it sharp. The image is
+scaled to fit the terminal window, so no more pixels are sent than can be shown.
 
 ![kitten icat and picat side by side, showing the same photo over a 10 Mbit/s link](docs/picat-vs-icat.gif)
 

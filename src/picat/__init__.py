@@ -1,6 +1,6 @@
 """Show an image in kitty quickly over a slow connection, sized to fit the terminal window: a tiny
 preview (1/16 of the width) first, then larger ones (1/4 and 1/2), then the full-resolution image as
-horizontal strips, each a separate image covering the preview where it lands. The prompt returns
+horizontal strips, the most detailed parts first. The prompt returns
 once the first preview is on screen; the rest loads in the background, a little slower than the
 link's measured rate so that typing stays responsive, and stops if another command is run.
 
@@ -34,7 +34,7 @@ import threading
 import tty
 import time
 
-from PIL import Image
+from PIL import Image, ImageChops, ImageStat
 
 from picat.diacritics import DIACRITICS
 
@@ -429,6 +429,16 @@ def show(img, out=None, strip_count=24, progress=False, detach=False, stop=lambd
             os._exit(0)
 
 
+def improvement_order(final, rows, oy):
+    """`rows` (pixel ranges of the image) ordered by how much full resolution improves each: the
+    preview on screen already shows smooth areas well, so detailed ones are worth sending first.
+    A load cut short then leaves the most detailed parts sharp."""
+    shown = final.resize((max(1, final.width // 2), max(1, final.height // 2)), Image.LANCZOS).resize(final.size, Image.BICUBIC)
+    diff = ImageChops.difference(final.convert("RGB"), shown.convert("RGB")).convert("L")
+    gain = lambda r: ImageStat.Stat(diff.crop((0, r[0] - oy, final.width, r[1] - oy))).sum[0]
+    return sorted(rows, key=gain, reverse=True)
+
+
 def rest(img, out, send, bar, preview, later, shown, bands, target, offset, parent, grid, below):
     """Everything still to send: the remaining previews, as (index, size), then the
     full-resolution strips, written into the image and covering only the picture's own rows.
@@ -443,8 +453,8 @@ def rest(img, out, send, bar, preview, later, shown, bands, target, offset, pare
 
     def encode():
         final = img if img.size == target else img.resize(target, Image.LANCZOS)
-        for y0, y1 in rows:
-            encoded.put(png(final.crop((0, y0 - oy, target[0], y1 - oy))))
+        for y0, y1 in improvement_order(final, rows, oy):
+            encoded.put((y0, png(final.crop((0, y0 - oy, target[0], y1 - oy)))))
 
     threading.Thread(target=lambda: [previews.put(preview(size)) for _, size in later], daemon=True).start()
     threading.Thread(target=encode, daemon=True).start()
@@ -457,8 +467,8 @@ def rest(img, out, send, bar, preview, later, shown, bands, target, offset, pare
         bar(b64(len(data)) / s**2)  # the full image, judged from this preview
 
     strip_bytes = []
-    for j, (y0, y1) in enumerate(rows):
-        data = encoded.get()
+    for j in range(len(rows)):
+        y0, data = encoded.get()
         strip_bytes.append(b64(len(data)))
         send(data, f"a=f,r=1,X=1,f=100,i={parent},x={ox},y={y0},q=2", repeat=True)  # X=1: replace
         bar((len(rows) - j - 1) * sum(strip_bytes) / len(strip_bytes))

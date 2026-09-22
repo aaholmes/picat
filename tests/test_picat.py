@@ -152,12 +152,15 @@ def transmissions(s):
 
     from PIL import Image
 
-    found = []
+    found, ends = [], []
     for m in re.finditer(r"\x1b_G(a=[Tf],[^;]*);", s):
+        if any(m.start() < e for e in ends):
+            continue  # a later chunk of the transmission already read (its keys are repeated)
         end = s.index("\x1b\\", s.index("m=0;", m.start()))
         payload = "".join(re.findall(r";([A-Za-z0-9+/=]*)(?:\x1b\\|$)", s[m.start():end + 2]))
         keys = dict(kv.split("=") for kv in m.group(1).split(",") if kv != "m=1" and kv != "m=0")
         found.append((keys, Image.open(io.BytesIO(base64.b64decode(payload))).size))
+        ends.append(end)
     return found
 
 
@@ -178,8 +181,6 @@ def test_the_finished_image_is_placeholder_text_filled_in_by_frame_edits(monkeyp
     assert image["a"] == "T" and image["U"] == "1"
     strips = [k for k, _ in rest if k["a"] == "f"]
     assert strips and all(k["i"] == image["i"] and k["r"] == "1" for k in strips)
-    ys = [int(k["y"]) for k in strips]
-    assert ys == sorted(ys)
 
 
 def test_previews_are_placed_under_the_image_and_deleted_when_done(monkeypatch):
@@ -454,3 +455,22 @@ def test_show_repeats_the_keys_in_every_chunk_of_a_frame_edit(monkeypatch):
     chunks = re.findall(r"\x1b_G([^;]*);", s)
     after_edit = [k for prev, k in zip(chunks, chunks[1:]) if prev.startswith("a=f") and "m=1" in prev]
     assert after_edit and all(k.startswith("a=f") for k in after_edit)
+
+
+def test_strips_are_sent_where_they_improve_the_picture_most_first(monkeypatch):
+    # The preview already shows the smooth parts well; the detailed ones gain most from
+    # full resolution, so they go first. A load cut short then leaves the most detail sharp.
+    import os
+
+    from PIL import Image
+
+    picture = Image.new("RGB", (2400, 1600), "white")
+    band = Image.frombytes("RGB", (2400, 200), os.urandom(2400 * 200 * 3))  # detail, low down
+    picture.paste(band, (0, 1200))
+    sent = transmissions(run_show(monkeypatch, image=picture))
+    strips = [k for k, _ in sent if k["a"] == "f"]
+    ys = [int(k["y"]) for k in strips]
+    assert ys != sorted(ys)  # not top to bottom
+    noisy = [y for y, k in zip(ys, strips) if 0.7 < (y - min(ys)) / (max(ys) - min(ys)) < 0.85]
+    assert ys.index(noisy[0]) < len(ys) // 4  # the detailed band goes early
+    assert sorted(ys) == sorted(set(ys)) and len(ys) > 8  # still every strip, once
