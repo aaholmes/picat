@@ -354,3 +354,49 @@ def test_stopping_mid_image_closes_that_image_first(monkeypatch):
     assert chunks_never_interleave(full)
     assert chunks_never_interleave(s)
     assert len(s) < len(full) / 2
+
+
+@pytest.fixture(autouse=True)
+def private_cache(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    monkeypatch.setenv("SSH_CONNECTION", "192.0.2.1 5000 192.0.2.2 22")
+
+
+def test_rate_cache_keeps_a_rate_for_ten_minutes_per_client(tmp_path):
+    from picat import load_rate, save_rate
+
+    path = tmp_path / "rates.json"
+    save_rate(path, "a", 1e6, now=100)
+    assert load_rate(path, "a", now=100 + 599) == 1e6
+    assert load_rate(path, "a", now=100 + 601) is None
+    assert load_rate(path, "b", now=100) is None
+    path.write_text("not json")
+    assert load_rate(path, "a", now=100) is None
+
+
+def test_detached_show_with_a_known_rate_returns_without_waiting_for_replies(monkeypatch):
+    import os
+    import time
+
+    from picat import rate_cache, save_rate
+
+    save_rate(rate_cache(), "192.0.2.1", 1e6, now=time.time())
+    forks = []
+    monkeypatch.setattr(os, "fork", lambda: forks.append(1) or 1)
+
+    def reply(image_id):
+        raise AssertionError("waited for a reply")
+
+    sent = transmissions(run_show(monkeypatch, detach=True, reply=reply))
+    assert forks and len(sent) == 1 and sent[0][0]["q"] == "2"
+
+
+def test_detached_show_remembers_the_rate_it_measured(monkeypatch):
+    import os
+    import time
+
+    from picat import load_rate, rate_cache
+
+    monkeypatch.setattr(os, "fork", lambda: 1)
+    run_show(monkeypatch, detach=True, reply=lambda image_id: True)
+    assert load_rate(rate_cache(), "192.0.2.1", now=time.time()) > 0

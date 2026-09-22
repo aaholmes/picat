@@ -1,18 +1,24 @@
 """Show an image in kitty quickly over a slow connection, sized to fit the terminal window: a tiny
 preview (1/16 of the width) first, then larger ones (1/4 and 1/2), then the full-resolution image as
-horizontal strips, each a separate image replacing the preview where it lands.
+horizontal strips, each a separate image covering the preview where it lands. The prompt returns
+once the first preview is on screen; the rest loads in the background, a little slower than the
+link's measured rate so that typing stays responsive, and stops if another command is run.
 
 Uses kitty's graphics protocol with Unicode placeholders, so it also works inside tmux (which needs
 `set -g allow-passthrough on`).
 
 Usage: picat [--progress] IMAGE    (`-` reads the image from standard input)
 
-  --progress, -p   show a bar below the image with the time left
+  --progress, -p   load everything before returning the prompt, with a bar below the image
+                   showing the time left
+
+Set PICAT_LOG to a file name to log the measured link rate and how background loads ended.
 """
 
 import base64
 import fcntl
 import io
+import json
 import math
 import os
 import queue
@@ -214,6 +220,45 @@ class Pacer:
             self.sleep(ahead)
 
 
+RATE_MAX_AGE = 600  # seconds a measured link rate is trusted for
+
+
+def rate_cache():
+    return os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "picat", "rates.json")
+
+
+def link_key():
+    """Which link a rate belongs to: the ssh client's address, or "local"."""
+    return (os.environ.get("SSH_CONNECTION") or "local").split()[0]
+
+
+def load_rate(path, key, now):
+    """The rate (bytes/s) measured for `key` within the last RATE_MAX_AGE seconds, or None."""
+    try:
+        with open(path) as f:
+            entry = json.load(f)[key]
+        if now - entry["time"] <= RATE_MAX_AGE:
+            return entry["rate"]
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return None
+
+
+def save_rate(path, key, rate, now):
+    try:
+        with open(path) as f:
+            rates = json.load(f)
+    except (OSError, ValueError):
+        rates = {}
+    rates[key] = {"rate": rate, "time": now}
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(rates, f)
+    except OSError:
+        pass  # only a cache
+
+
 def terminal_replies():
     """A function that waits for kitty's reply about an image, reading from the terminal, and one
     that puts the terminal back as it was. None if there is no terminal to read."""
@@ -299,13 +344,18 @@ def show(img, out=None, strip_count=24, progress=False, detach=False, stop=lambd
     grid = f"c={ncols},r={nrows}"
     below = f"p=1,P={parent},Q=1,H=0,C=1"  # placed relative to the first preview
     restore = None
-    if detach and reply is None:
+    # A rate measured recently on this link is reused: then nothing needs to be read from the
+    # terminal, and the prompt returns as soon as the first preview is sent.
+    rate = load_rate(rate_cache(), link_key(), time.time()) if detach else None
+    if rate:
+        log(f"known rate {8 * rate / 1e6:.1f} Mbit/s, pacing at 90%")
+    if detach and not rate and reply is None:
         replies = terminal_replies()
         if replies:
             reply, restore = replies
         else:
             detach = False
-    quiet = "q=0" if detach else "q=2"  # q=0: kitty replies OK once it has the whole image
+    quiet = "q=0" if detach and not rate else "q=2"  # q=0: kitty replies OK once it has the whole image
 
     try:
         data = preview(sizes[0])[1] if sizes else png(img if img.size == target else img.resize(target, Image.LANCZOS))
@@ -316,7 +366,7 @@ def show(img, out=None, strip_count=24, progress=False, detach=False, stop=lambd
         if not sizes:
             return
         shown, later = None, list(enumerate(sizes[1:]))
-        if detach:
+        if detach and not rate:
             first = (sent - before, time.monotonic() - t0) if reply(parent) else None
             s, data = preview(sizes[1])
             before, t0 = sent, time.monotonic()
@@ -330,6 +380,7 @@ def show(img, out=None, strip_count=24, progress=False, detach=False, stop=lambd
                 rate = second[0] / max(second[1], 1e-3)
             if second:
                 log(f"rate {8 * rate / 1e6:.1f} Mbit/s, pacing at 90%")
+                save_rate(rate_cache(), link_key(), rate, time.time())
             else:
                 detach = False  # no replies: without the rate, sending in the background would
                 # queue data ahead of the shell's output, so carry on in the foreground
