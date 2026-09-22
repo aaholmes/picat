@@ -17,11 +17,15 @@ import math
 import os
 import queue
 import random
+import re
+import select
+import signal
 import struct
 import subprocess
 import sys
 import termios
 import threading
+import tty
 import time
 
 from PIL import Image
@@ -98,11 +102,6 @@ def placeholders(image_id, cols, rows, indent=0):
     return colour(image_id) + "\n".join(lines) + f"{ESC}[39m"
 
 
-def placeholder_row(image_id, row, cols, indent=0):
-    """One row of placeholders, showing row `row` of the image."""
-    return colour(image_id) + " " * indent + cell_row(row, cols) + f"{ESC}[39m"
-
-
 def cell_row(row, cols):
     return "".join(PLACEHOLDER + chr(DIACRITICS[row]) + chr(DIACRITICS[col]) for col in range(cols))
 
@@ -152,7 +151,98 @@ def small_png(img, size, offset):
     return png(canvas)
 
 
-def show(img, out=None, strip_count=24, progress=False):
+class Stopped(Exception):
+    pass
+
+
+class CommandWatcher:
+    """Tells when the user has run a command since picat returned the prompt: the terminal's
+    foreground process group changes from picat's to the shell's, then to the command's."""
+
+    def __init__(self, foreground, own):
+        self.foreground, self.own, self.shell = foreground, own, None
+
+    def command_started(self):
+        try:
+            fg = self.foreground()
+        except OSError:
+            return False
+        if fg == self.own:
+            return False
+        if self.shell is None:
+            self.shell = fg
+        return fg != self.shell
+
+
+def estimate_rate(small, large):
+    """Link rate in bytes/s from two (bytes, seconds until kitty's reply) measurements. The
+    difference cancels the latency. Timings are noisy, and too high an estimate would queue data
+    ahead of the shell's output, so it is capped at 1.5 times the larger transfer's plain average
+    (which includes the latency, so underestimates the rate), and falls back to that average."""
+    (b1, t1), (b2, t2) = small, large
+    average = b2 / max(t2, 1e-3)
+    if t2 > t1 and b2 > b1:
+        return min((b2 - b1) / (t2 - t1), 1.5 * average)
+    return average
+
+
+def wait_ok(fd, image_id, timeout):
+    """Wait for kitty's reply about `image_id` on `fd`: True for OK, False for an error or none."""
+    end, buf = time.monotonic() + timeout, b""
+    pattern = re.compile(rb"\x1b_Gi=(\d+)[^;]*;([^\x1b]*)\x1b\\")
+    while True:
+        for m in pattern.finditer(buf):
+            if int(m.group(1)) == image_id:
+                return m.group(2) == b"OK"
+        left = end - time.monotonic()
+        if left <= 0 or not select.select([fd], [], [], left)[0]:
+            return False
+        buf += os.read(fd, 4096)
+
+
+class Pacer:
+    """Sleeps as needed so that data goes out no faster than `rate` bytes/s."""
+
+    def __init__(self, rate, clock=time.monotonic, sleep=time.sleep):
+        self.rate, self.clock, self.sleep = rate, clock, sleep
+        self.start, self.total = clock(), 0
+
+    def sent(self, n):
+        self.total += n
+        ahead = self.start + self.total / self.rate - self.clock()
+        if ahead > 0:
+            self.sleep(ahead)
+
+
+def terminal_replies():
+    """A function that waits for kitty's reply about an image, reading from the terminal, and one
+    that puts the terminal back as it was. None if there is no terminal to read."""
+    try:
+        fd = os.open("/dev/tty", os.O_RDWR)
+        saved = termios.tcgetattr(fd)
+    except OSError:
+        return None
+    tty.setcbreak(fd)  # the reply is not echoed, and arrives without waiting for a newline
+
+    def restore():
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        os.close(fd)
+
+    return (lambda image_id: wait_ok(fd, image_id, timeout=2)), restore
+
+
+def show(img, out=None, strip_count=24, progress=False, detach=False, stop=lambda: False, reply=None):
+    """Draw `img` below the cursor.
+
+    With `detach`, return once the first two previews are on screen and send the rest from a
+    background process, so the prompt comes back quickly. The link rate is measured from how long
+    kitty takes to acknowledge those two previews, and the rest is sent a little slower than that,
+    so the shell's output is never stuck behind a queue of image data. The background process
+    stops when the user runs a command. With a reply to only the second preview, its plain
+    average rate is used; with none, it all runs in the foreground instead.
+
+    `stop()` is checked before each chunk sent (the background process watches for commands this
+    way), and `reply(image_id)` (for tests) stands in for waiting for kitty's reply."""
     out = out or sys.stdout
     cols, rows, cw, ch = terminal_geometry()
     target = fit(img.size, (cols * cw, max(1, rows - 3) * ch))  # room for the bar and the prompt
@@ -160,20 +250,122 @@ def show(img, out=None, strip_count=24, progress=False):
     ncols, nrows = min(ncols, len(DIACRITICS)), min(nrows, len(DIACRITICS))
     indent = (cols - ncols) // 2  # centred, as icat does
     wrap = wrap_tmux if os.environ.get("TMUX") else (lambda s: s)
-    # kitty fits each image into its box keeping the aspect ratio and centres it, so every strip
-    # must have the same scale, or it is shifted sideways.
-    # Heights must be exact: a strip is ~50 pixels tall and ~30 times as wide, so half a pixel of
-    # rounding in its height would shift its sides by ~15. So each cell row is a whole number of
-    # image pixels tall, and the image is scaled by the (tiny) factor this needs.
+
+    # The first preview is shown through placeholder text, written once. Everything after it is
+    # placed relative to that (kitty keeps such placements in step with the text as it scrolls),
+    # so the image can improve without touching the text, while the shell uses the terminal.
+    # Placeholder images keep their aspect ratio inside their box of cells, while relative
+    # placements given a size in cells are stretched to fill it, so previews are padded to exactly
+    # the box's shape; the full-resolution strips are placed at their natural pixel size instead.
+    # Each cell row is a whole number of image pixels, so strips need no scaling.
     k = max(1, round(ch)) / ch
     target = max(1, round(target[0] * k)), max(1, round(target[1] * k))
-    # Only the height is padded: strips that all share one scale are centred with equal margins.
-    canvas = target[0], nrows * max(1, round(ch))
-    offset = 0, (canvas[1] - target[1]) // 2
-    bands = strips(canvas[1], nrows, strip_count)
+    box = round(ncols * cw * k), nrows * max(1, round(ch))
+    offset = (box[0] - target[0]) // 2, (box[1] - target[1]) // 2
+    bands = strips(box[1], nrows, strip_count)
+    sizes = preview_sizes(box)
+    detach = detach and len(sizes) >= 2  # two previews are needed to measure the link
 
-    # Encode the full-resolution strips in the background while the previews go out.
-    encoded = queue.Queue()
+    sent, start, pacer = 0, time.monotonic(), None
+
+    def send(data, control):
+        nonlocal sent
+        for n, cmd in enumerate(graphics_commands(data, control)):
+            if stop():  # checked before every chunk, so the terminal is freed within one chunk
+                if n:  # end this image's chunks, so kitty is ready for another program's image
+                    out.write(wrap(f"{ESC}_Gm=0;{ESC}\\"))
+                    out.flush()
+                raise Stopped
+            out.write(wrap(cmd))
+            out.flush()  # one write per sequence, so the shell's output cannot split it
+            sent += len(cmd)
+            if pacer:
+                pacer.sent(len(cmd))
+
+    def bar(remaining):  # `remaining`: estimated bytes still to send
+        if progress:
+            total = sent + remaining
+            rate = sent / max(time.monotonic() - start, 1e-3)
+            out.write("\r" + " " * indent + progress_bar(min(1, sent / total), max(0, total - sent) / rate, max(20, ncols)) + f"{ESC}[K")
+            out.flush()
+
+    def preview(size):
+        s = size[0] / box[0]
+        inner = max(1, round(target[0] * s)), max(1, round(target[1] * s))
+        small = img.resize(inner, Image.LANCZOS, reducing_gap=3.0)
+        return s, small_png(small, size, (round(offset[0] * s), round(offset[1] * s)))
+
+    parent = random.randint(1, 2**24 - 5 - strip_count)  # later stages take the ids after it
+    grid = f"c={ncols},r={nrows}"
+    below = f"p=1,P={parent},Q=1,H=0,C=1"  # placed relative to the first preview
+    restore = None
+    if detach and reply is None:
+        replies = terminal_replies()
+        if replies:
+            reply, restore = replies
+        else:
+            detach = False
+    quiet = "q=0" if detach else "q=2"  # q=0: kitty replies OK once it has the whole image
+
+    try:
+        data = preview(sizes[0])[1] if sizes else png(img if img.size == target else img.resize(target, Image.LANCZOS))
+        before, t0 = sent, time.monotonic()  # time the link only, not preparing the image
+        send(data, f"a=T,U=1,f=100,i={parent},p=1,{grid},{quiet}")
+        out.write(placeholders(parent, ncols, nrows, indent) + "\n")
+        out.flush()
+        if not sizes:
+            return
+        shown, later = None, list(enumerate(sizes[1:]))
+        if detach:
+            first = (sent - before, time.monotonic() - t0) if reply(parent) else None
+            s, data = preview(sizes[1])
+            before, t0 = sent, time.monotonic()
+            send(data, f"a=T,f=100,i={parent + 1},V=0,{grid},z=1,{below},q=0")
+            second = (sent - before, time.monotonic() - t0) if reply(parent + 1) else None
+            shown, later = parent + 1, later[1:]
+            log(f"replies {first} {second}")
+            if first and second:
+                rate = estimate_rate(first, second)
+            elif second:  # its plain average underestimates the rate, so is safe
+                rate = second[0] / max(second[1], 1e-3)
+            if second:
+                log(f"rate {8 * rate / 1e6:.1f} Mbit/s, pacing at 90%")
+            else:
+                detach = False  # no replies: without the rate, sending in the background would
+                # queue data ahead of the shell's output, so carry on in the foreground
+    finally:
+        if restore:
+            restore()
+
+    if detach:
+        if os.fork():
+            return
+        # Stay in the terminal's session, so its foreground process group can be read.
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        fd = out.fileno()
+        stop = CommandWatcher(lambda: os.tcgetpgrp(fd), os.getpgrp()).command_started
+        pacer = Pacer(0.9 * rate)
+    try:
+        try:
+            ended = rest(img, out, send, bar, preview, later, shown, bands, target, offset, parent, grid, below)
+        except Stopped:
+            ended = "stopped for a command"
+        log(f"{ended} after {time.monotonic() - start:.2f} s, {sent} bytes")
+    finally:
+        if progress:
+            out.write(f"\r{ESC}[2K")
+            out.flush()
+        if detach:
+            os._exit(0)
+
+
+def rest(img, out, send, bar, preview, later, shown, bands, target, offset, parent, grid, below):
+    """Everything still to send: the remaining previews, as (index, size), then the
+    full-resolution strips. Images are prepared in background threads while earlier ones are
+    sent."""
+    wrap = wrap_tmux if os.environ.get("TMUX") else (lambda s: s)
+    b64 = lambda n: 4 * math.ceil(n / 3)
+    encoded, previews = queue.Queue(), queue.Queue()
 
     def encode():
         final = img if img.size == target else img.resize(target, Image.LANCZOS)
@@ -185,75 +377,35 @@ def show(img, out=None, strip_count=24, progress=False):
                 encoded.put(png(pad(final.crop((0, max(0, y0 - oy), target[0], min(target[1], y1 - oy))),
                                     (target[0], y1 - y0), (0, max(0, oy - y0)))))
 
+    threading.Thread(target=lambda: [previews.put(preview(size)) for _, size in later], daemon=True).start()
     threading.Thread(target=encode, daemon=True).start()
 
-    sent, start = 0, time.monotonic()
+    for n, _ in later:
+        s, data = previews.get()
+        send(data, f"a=T,f=100,i={parent + 1 + n},V=0,{grid},z={1 + n},{below},q=2")
+        if shown:  # the new preview now covers it
+            out.write(wrap(f"{ESC}_Ga=d,d=I,i={shown},q=2{ESC}\\"))
+        shown = parent + 1 + n
+        bar(b64(len(data)) / s**2)  # the full image, judged from this preview
 
-    def send(data, control):
-        nonlocal sent
-        for cmd in graphics_commands(data, control):
-            cmd = wrap(cmd)
-            out.write(cmd)
-            sent += len(cmd)
-        out.flush()
-
-    def bar(total):
-        if not progress:
-            return
-        rate = sent / max(time.monotonic() - start, 1e-3)
-        out.write("\r" + " " * indent + progress_bar(min(1, sent / total), max(0, total - sent) / rate, max(20, ncols)) + f"{ESC}[K")
-        out.flush()
-
-    def draw_row(image_id, row, image_row=None):  # the cursor waits on the bar line, below the image
-        up = nrows - row
-        image_row = row if image_row is None else image_row
-        out.write(f"{ESC}[{up}A\r" + placeholder_row(image_id, image_row, ncols, indent) + f"{ESC}[{up}B\r")
-
-    b64 = lambda n: 4 * math.ceil(n / 3)
-    first = random.randint(1, 2**24 - 5 - strip_count)  # previews and strips take the ids after it
-    grid = f"U=1,f=100,c={ncols},r={nrows},q=2"
-    # Previews are also made in the background, so each is prepared while the one before is sent.
-    sizes = preview_sizes(canvas)
-    previews = queue.Queue()
-
-    def make_previews():
-        for size in sizes:
-            k = size[0] / canvas[0]
-            inner = max(1, round(target[0] * k)), max(1, round(target[1] * k))
-            small = img.resize(inner, Image.LANCZOS, reducing_gap=3.0)
-            previews.put((k, small_png(small, size, (round(offset[0] * k), round(offset[1] * k)))))
-
-    threading.Thread(target=make_previews, daemon=True).start()
-    preview_ids, estimate = [], None  # estimate: bytes of the full image, from the latest preview
-    for n in range(1, len(sizes) + 1):
-        k, data = previews.get()
-        send(data, f"a=T,i={first + n},{grid}")
-        preview_ids.append(first + n)
-        estimate = b64(len(data)) / k**2
-        if n == 1:
-            out.write(placeholders(first + n, ncols, nrows, indent) + "\n")
-        else:
-            for row in range(nrows):
-                draw_row(first + n, row)
-        bar(sent + estimate)
-
-    # Each full-resolution strip is its own image, covering whole cell rows, so it can replace the
-    # preview row by row as it arrives.
-    if not preview_ids:
-        out.write("\n" * nrows)
     strip_bytes = []
     for j, (r0, r1, y0, y1) in enumerate(bands):
         data = encoded.get()
         strip_bytes.append(b64(len(data)))
-        send(data, f"a=T,i={first + 4 + j},U=1,f=100,c={ncols},r={r1 - r0},q=2")
-        for row in range(r0, r1):
-            draw_row(first + 4 + j, row, row - r0)
-        left = len(bands) - j - 1
-        bar(sent + left * sum(strip_bytes) / len(strip_bytes))
-    for i in preview_ids:
-        out.write(wrap(f"{ESC}_Ga=d,d=I,i={i},q=2{ESC}\\"))  # free the previews' memory
-    out.write(f"\r{ESC}[2K")
+        send(data, f"a=T,f=100,i={parent + 4 + j},V={r0},X={offset[0]},z=10,{below},q=2")
+        bar((len(bands) - j - 1) * sum(strip_bytes) / len(strip_bytes))
+    if shown:
+        out.write(wrap(f"{ESC}_Ga=d,d=I,i={shown},q=2{ESC}\\"))
     out.flush()
+    return "finished"
+
+
+def log(message):
+    """Append to the file named by $PICAT_LOG, if set: for finding out what a run did."""
+    path = os.environ.get("PICAT_LOG")
+    if path:
+        with open(path, "a") as f:
+            f.write(f"{time.strftime('%H:%M:%S')} {os.getpid()} {message}\n")
 
 
 def main():
@@ -265,4 +417,4 @@ def main():
     src = sys.stdin.buffer if args[0] == "-" else args[0]
     img = Image.open(src)
     img = img.convert("RGBA" if "A" in img.getbands() else "RGB")
-    show(img, progress=progress)
+    show(img, progress=progress, detach=not progress)

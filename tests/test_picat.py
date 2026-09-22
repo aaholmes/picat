@@ -116,67 +116,6 @@ def test_progress_bar_shows_fraction_and_time_left():
     assert bar.count("█") == 5 and bar.count("░") == 5  # 10 cells left for the bar itself
 
 
-def test_show_sends_three_previews_then_strips(monkeypatch):
-    import io
-    import re
-
-    from PIL import Image
-
-    import picat
-
-    monkeypatch.setattr(picat, "terminal_geometry", lambda: (100, 40, 10, 20))
-    monkeypatch.delenv("TMUX", raising=False)
-    out = io.StringIO()
-    picat.show(Image.new("RGB", (2000, 1000)), out=out)
-    s = out.getvalue()
-    grids = re.findall(r"_Ga=T,[^;]*?c=(\d+),r=(\d+)", s)
-    assert len({c for c, _ in grids}) == 1  # all stretched to one width in cells
-    assert len(grids) > 4  # three previews, then several strips
-    nrows = int(grids[0][1])
-    assert sum(int(r) for _, r in grids[3:]) == nrows  # strips tile the image's rows
-    assert s.count("_Ga=d,d=I") == 3  # all previews freed
-    assert s.rstrip().endswith("\x1b[2K") or "\x1b[2K" in s[-40:]  # progress bar cleared
-
-
-def test_every_image_matches_its_cell_box_so_strips_line_up(monkeypatch):
-    # kitty fits each image into its c x r box keeping the aspect ratio, centring it; any
-    # mismatch shifts that strip sideways and makes the image's edges jagged.
-    import io
-    import re
-
-    from PIL import Image
-
-    import picat
-
-    cw, ch = 9.4, 18.1
-    monkeypatch.setattr(picat, "terminal_geometry", lambda: (213, 57, cw, ch))
-    monkeypatch.delenv("TMUX", raising=False)
-    out = io.StringIO()
-    picat.show(Image.new("RGB", (3072, 2048), "red"), out=out)
-    s = out.getvalue()
-    starts = list(re.finditer(r"\x1b_Ga=T,[^;]*?c=(\d+),r=(\d+)", s))
-    assert len(starts) > 3
-    widths = []  # on screen, in pixels
-    for m in starts:
-        end = s.index("\x1b\\", s.index("m=0;", m.start()))
-        payload = "".join(re.findall(r";([A-Za-z0-9+/=]*)(?:\x1b\\|$)", s[m.start():end + 2]))
-        w, h = Image.open(io.BytesIO(base64.b64decode(payload))).size
-        c, r = int(m.group(1)), int(m.group(2))
-        widths.append(min(c * cw, w * r * ch / h))
-    previews, strip_widths = widths[:3], widths[3:]
-    assert max(strip_widths) - min(strip_widths) < 1
-    assert all(abs(p - strip_widths[0]) < 0.01 * strip_widths[0] for p in previews)
-
-
-def test_placeholder_row_names_that_row_in_every_cell():
-    from picat import placeholder_row
-
-    cell = chr(0x10EEEE)
-    s = placeholder_row(image_id=1, row=3, cols=4, indent=2)
-    body = s.split("m", 1)[1].rsplit("\x1b", 1)[0]
-    assert body == "  " + "".join(cell + chr(DIACRITICS[3]) + chr(DIACRITICS[c]) for c in range(4))
-
-
 @pytest.mark.parametrize("progress", [False, True])
 def test_progress_bar_only_when_asked(monkeypatch, progress):
     import io
@@ -192,13 +131,226 @@ def test_progress_bar_only_when_asked(monkeypatch, progress):
     assert ("░" in out.getvalue()) == progress
 
 
-def test_main_reads_progress_flag(monkeypatch):
+def run_show(monkeypatch, geometry=(213, 57, 9.4, 18.1), size=(3072, 2048), image=None, **kw):
+    import io
+
+    from PIL import Image
+
+    import picat
+
+    monkeypatch.setattr(picat, "terminal_geometry", lambda: geometry)
+    monkeypatch.delenv("TMUX", raising=False)
+    out = io.StringIO()
+    picat.show(image or Image.new("RGB", size, "red"), out=out, **kw)
+    return out.getvalue()
+
+
+def transmissions(s):
+    """(control keys, decoded image size) for each image sent."""
+    import io
+    import re
+
+    from PIL import Image
+
+    found = []
+    for m in re.finditer(r"\x1b_G(a=T,[^;]*);", s):
+        end = s.index("\x1b\\", s.index("m=0;", m.start()))
+        payload = "".join(re.findall(r";([A-Za-z0-9+/=]*)(?:\x1b\\|$)", s[m.start():end + 2]))
+        keys = dict(kv.split("=") for kv in m.group(1).split(",") if kv != "m=1" and kv != "m=0")
+        found.append((keys, Image.open(io.BytesIO(base64.b64decode(payload))).size))
+    return found
+
+
+def test_placeholder_text_is_written_once_with_no_cursor_movement(monkeypatch):
+    import re
+
+    s = run_show(monkeypatch)
+    assert s.count("\x1b[38;2;") == 1
+    assert not re.search(r"\x1b\[\d+[AB]", s)
+
+
+def test_later_stages_are_placed_relative_to_the_first_preview(monkeypatch):
+    sent = transmissions(run_show(monkeypatch))
+    (parent, _), rest = sent[0], sent[1:]
+    assert parent["U"] == "1" and parent["p"] == "1"
+    assert all(k["P"] == parent["i"] and k["Q"] == "1" and "U" not in k for k, _ in rest)
+    previews = [k for k, _ in rest if "c" in k]
+    strips = [k for k, _ in rest if "c" not in k]
+    assert len(previews) == 2 and all(k["c"] == parent["c"] and k["r"] == parent["r"] for k in previews)
+    assert [int(k["V"]) for k in strips][0] == 0 and len(strips) > 1
+    assert sorted(int(k["V"]) for k in strips) == [int(k["V"]) for k in strips]
+
+
+def test_replaced_previews_are_deleted_but_not_the_first(monkeypatch):
+    import re
+
+    s = run_show(monkeypatch)
+    sent = transmissions(s)
+    deleted = re.findall(r"_Ga=d,d=I,i=(\d+)", s)
+    assert sorted(deleted) == sorted(k["i"] for k, _ in sent[1:3])
+
+
+def test_previews_have_the_shape_of_the_box_and_strips_their_natural_size(monkeypatch):
+    cw, ch = 9.4, 18  # kitty's cells are whole pixels; only a guessed size can be fractional
+    sent = transmissions(run_show(monkeypatch, geometry=(213, 57, cw, ch)))
+    for k, (w, h) in sent[:3]:
+        box = int(k["c"]) * cw / (int(k["r"]) * ch)
+        assert abs(w / h - box) < 0.01 * box
+    strips = sent[3:]
+    width = strips[0][1][0]
+    assert all(size[0] == width for _, size in strips)
+    ncols = int(sent[0][0]["c"])
+    for k, (w, h) in strips:
+        assert abs(int(k["X"]) - (ncols * cw - w) / 2) <= 1 and int(k["X"]) < cw
+    assert sum(h for _, (w, h) in strips) == int(sent[0][0]["r"]) * round(ch)
+
+
+def test_main_detaches_unless_showing_progress(monkeypatch):
     import picat
 
     seen = {}
-    monkeypatch.setattr(picat, "show", lambda img, progress=False: seen.update(progress=progress))
+    monkeypatch.setattr(picat, "show", lambda img, **kw: seen.update(kw))
     monkeypatch.setattr(picat.Image, "open", lambda src: __import__("PIL.Image").Image.new("RGB", (4, 4)))
-    for argv, want in ((["picat", "x.png"], False), (["picat", "--progress", "x.png"], True)):
+    for argv, progress in ((["picat", "x.png"], False), (["picat", "--progress", "x.png"], True)):
         monkeypatch.setattr("sys.argv", argv)
         picat.main()
-        assert seen["progress"] is want
+        assert seen == {"progress": progress, "detach": not progress}
+
+
+def test_watcher_stops_once_a_command_takes_over_from_the_shell():
+    from picat import CommandWatcher
+
+    own, shell, cmd = 10, 20, 30
+    seq = iter([own, own, shell, shell, cmd])  # picat, then the shell's prompt, then a command
+    w = CommandWatcher(lambda: next(seq), own)
+    assert [w.command_started() for _ in range(5)] == [False, False, False, False, True]
+
+
+def test_watcher_never_stops_if_the_terminal_cannot_be_queried():
+    from picat import CommandWatcher
+
+    def fail():
+        raise OSError
+
+    assert not CommandWatcher(fail, 10).command_started()
+
+
+def test_rate_from_two_replies_cancels_the_latency():
+    from picat import estimate_rate
+
+    # 0.05 s latency and 1 MB/s: 10 KB -> 0.06 s, 400 KB -> 0.45 s
+    assert abs(estimate_rate((10_000, 0.06), (400_000, 0.45)) - 1e6) < 1
+    assert estimate_rate((10_000, 0.06), (400_000, 0.05)) == 400_000 / 0.05  # noisy: be safe
+    # a noisy difference can never claim more than 1.5 times the larger transfer's average
+    assert estimate_rate((10_000, 0.40), (400_000, 0.45)) == 1.5 * 400_000 / 0.45
+
+
+def test_link_timing_excludes_preparing_the_image(monkeypatch):
+    import picat
+
+    clock = [0.0]
+    monkeypatch.setattr(picat.time, "monotonic", lambda: clock[0])
+    real_preview_png = picat.small_png
+
+    def slow_small_png(*args):
+        clock[0] += 1.0  # preparing a preview takes a (simulated) second
+        return real_preview_png(*args)
+
+    monkeypatch.setattr(picat, "small_png", slow_small_png)
+    measured = []
+    monkeypatch.setattr(picat, "estimate_rate", lambda a, b: measured.extend([a, b]) or 1e6)
+    monkeypatch.setattr(picat.os, "fork", lambda: 1)
+    run_show(monkeypatch, detach=True, reply=lambda image_id: True)
+    assert [t for _, t in measured] == [0.0, 0.0]
+
+
+def test_wait_ok_finds_the_reply_among_other_input():
+    import os
+
+    from picat import wait_ok
+
+    r, w = os.pipe()
+    os.write(w, b"ab\x1b_Gi=7;OK\x1b\\cd")
+    assert wait_ok(r, 7, timeout=1) is True
+    os.write(w, b"\x1b_Gi=8;OK\x1b\\")
+    assert wait_ok(r, 7, timeout=0.1) is False
+
+
+def test_pacer_keeps_to_the_rate():
+    from picat import Pacer
+
+    now, slept = [0.0], []
+
+    def sleep(t):
+        slept.append(t)
+        now[0] += t
+
+    p = Pacer(1000, clock=lambda: now[0], sleep=sleep)
+    for _ in range(3):
+        p.sent(500)
+    assert abs(now[0] - 1.5) < 1e-9
+
+
+def test_detached_show_measures_the_link_then_leaves_the_rest_to_the_background(monkeypatch):
+    import os
+
+    forks = []
+    monkeypatch.setattr(os, "fork", lambda: forks.append(1) or 1)
+    s = run_show(monkeypatch, detach=True, reply=lambda image_id: True)
+    sent = transmissions(s)
+    assert forks and len(sent) == 2  # the tiny and 1/4 previews, both with replies asked for
+    assert all(k.get("q", "0") == "0" for k, _ in sent)
+
+
+def test_detached_show_stays_in_the_foreground_without_replies(monkeypatch):
+    import os
+
+    monkeypatch.setattr(os, "fork", lambda: (_ for _ in ()).throw(AssertionError("forked")))
+    s = run_show(monkeypatch, detach=True, reply=lambda image_id: False)
+    assert len(transmissions(s)) > 5  # everything, in the foreground
+
+
+def test_one_reply_is_enough_to_carry_on_in_the_background(monkeypatch):
+    import os
+
+    forks, asked = [], []
+    monkeypatch.setattr(os, "fork", lambda: forks.append(1) or 1)
+
+    def reply(image_id):
+        asked.append(image_id)
+        return len(asked) == 2  # no reply to the first preview, a reply to the second
+
+    run_show(monkeypatch, detach=True, reply=reply)
+    assert forks
+
+
+def chunks_never_interleave(s):
+    """kitty takes an image's chunks in sequence: after a chunk marked m=1, the next graphics
+    command must be that image's next chunk (no a= key), until one marked m=0."""
+    import re
+
+    open_ = False
+    for keys in re.findall(r"\x1b_G([^;\x1b]*)[;\x1b]", s):
+        if keys.startswith("a=") == open_:  # a new command while one is open, or a stray chunk
+            return False
+        open_ = "m=1" in keys
+    return not open_
+
+
+def test_stopping_mid_image_closes_that_image_first(monkeypatch):
+    calls = []
+
+    def stop():
+        calls.append(1)
+        return len(calls) > 40  # partway through some image's chunks
+
+    import os
+
+    from PIL import Image
+
+    noise = Image.frombytes("RGB", (1536, 1024), os.urandom(1536 * 1024 * 3))  # many chunks each
+    s = run_show(monkeypatch, image=noise, stop=stop)
+    full = run_show(monkeypatch, image=noise)
+    assert chunks_never_interleave(full)
+    assert chunks_never_interleave(s)
+    assert len(s) < len(full) / 2
