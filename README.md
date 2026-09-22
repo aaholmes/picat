@@ -6,6 +6,15 @@ ones (1/4 and 1/2 of the width), all stretched to the final size. The full-resol
 arrives in horizontal strips, each covering the preview where it lands. The image is scaled to fit
 the terminal window, so no more pixels are sent than can be shown.
 
+![kitten icat and picat side by side, showing the same photo over a 10 Mbit/s link](docs/picat-vs-icat.gif)
+
+picat shows a blurry preview after 0.2 s and a sharp image by 0.8 s; `kitten icat` shows nothing
+until the whole image arrives at 4.1 s. Both ran in kitty 0.32.2 windows of 1000×1400 pixels, with
+their output passed to kitty at 10 Mbit/s, and picat had already measured the link's rate. The
+photo, of Yosemite National Park, is by
+[Vulturesong](https://commons.wikimedia.org/wiki/File:Yosemite_National_Park_-_HCP_-_October_07,_2022_-_012.jpg)
+and in the public domain (CC0).
+
 ```sh
 uv tool install -e .     # installs the `picat` command
 picat image.png
