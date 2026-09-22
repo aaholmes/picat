@@ -340,9 +340,14 @@ def show(img, out=None, strip_count=24, progress=False, detach=False, stop=lambd
         small = img.resize(inner, Image.LANCZOS, reducing_gap=3.0)
         return s, small_png(small, size, (round(offset[0] * s), round(offset[1] * s)))
 
+    # The only placeholder text is the image's bottom row, the parent, and every stage is placed
+    # relative to it, reaching up over the rows above. kitty positions such a parent by its
+    # topmost row still on screen, so a taller parent would shift everything once its top had
+    # scrolled off; the bottom row is on screen for as long as any of the image is.
     parent = random.randint(1, 2**24 - 5 - strip_count)  # later stages take the ids after it
     grid = f"c={ncols},r={nrows}"
-    below = f"p=1,P={parent},Q=1,H=0,C=1"  # placed relative to the first preview
+    top = 1 - nrows  # the image's top row, relative to the parent
+    below = f"p=1,P={parent},Q=1,H=0,C=1"  # placed relative to the parent
     restore = None
     # A rate measured recently on this link is reused: then nothing needs to be read from the
     # terminal, and the prompt returns as soon as the first preview is sent.
@@ -358,21 +363,29 @@ def show(img, out=None, strip_count=24, progress=False, detach=False, stop=lambd
     quiet = "q=0" if detach and not rate else "q=2"  # q=0: kitty replies OK once it has the whole image
 
     try:
-        data = preview(sizes[0])[1] if sizes else png(img if img.size == target else img.resize(target, Image.LANCZOS))
-        before, t0 = sent, time.monotonic()  # time the link only, not preparing the image
-        send(data, f"a=T,U=1,f=100,i={parent},p=1,{grid},{quiet}")
-        out.write(placeholders(parent, ncols, nrows, indent) + "\n")
+        # Transparent, and exactly the row's shape: kitty draws a placeholder image centred in its
+        # cells keeping its aspect ratio, and places the stages relative to where it is drawn.
+        row = Image.new("RGBA", (box[0], box[1] // nrows))
+        send(png(row), f"a=T,U=1,f=100,i={parent},p=1,c={ncols},r=1,q=2")
+        out.write("\n" * (nrows - 1) + placeholders(parent, ncols, 1, indent) + "\n")
         out.flush()
+        if sizes:
+            data = preview(sizes[0])[1]
+        else:  # small enough to send whole
+            data = png(pad(img if img.size == target else img.resize(target, Image.LANCZOS), box, offset))
+        before, t0 = sent, time.monotonic()  # time the link only, not preparing the image
+        send(data, f"a=T,f=100,i={parent + 1},V={top},{grid},z=1,{below},{quiet}")
         if not sizes:
             return
-        shown, later = None, list(enumerate(sizes[1:]))
+        shown, later = parent + 1, list(enumerate(sizes))[1:]
         if detach and not rate:
-            first = (sent - before, time.monotonic() - t0) if reply(parent) else None
+            first = (sent - before, time.monotonic() - t0) if reply(parent + 1) else None
             s, data = preview(sizes[1])
             before, t0 = sent, time.monotonic()
-            send(data, f"a=T,f=100,i={parent + 1},V=0,{grid},z=1,{below},q=0")
-            second = (sent - before, time.monotonic() - t0) if reply(parent + 1) else None
-            shown, later = parent + 1, later[1:]
+            send(data, f"a=T,f=100,i={parent + 2},V={top},{grid},z=2,{below},q=0")
+            second = (sent - before, time.monotonic() - t0) if reply(parent + 2) else None
+            out.write(wrap(f"{ESC}_Ga=d,d=I,i={shown},q=2{ESC}\\"))  # the new preview covers it
+            shown, later = parent + 2, later[1:]
             log(f"replies {first} {second}")
             if first and second:
                 rate = estimate_rate(first, second)
@@ -398,7 +411,7 @@ def show(img, out=None, strip_count=24, progress=False, detach=False, stop=lambd
         pacer = Pacer(0.9 * rate)
     try:
         try:
-            ended = rest(img, out, send, bar, preview, later, shown, bands, target, offset, parent, grid, below)
+            ended = rest(img, out, send, bar, preview, later, shown, bands, target, offset, parent, grid, below, top)
         except Stopped:
             ended = "stopped for a command"
         log(f"{ended} after {time.monotonic() - start:.2f} s, {sent} bytes")
@@ -410,7 +423,7 @@ def show(img, out=None, strip_count=24, progress=False, detach=False, stop=lambd
             os._exit(0)
 
 
-def rest(img, out, send, bar, preview, later, shown, bands, target, offset, parent, grid, below):
+def rest(img, out, send, bar, preview, later, shown, bands, target, offset, parent, grid, below, top):
     """Everything still to send: the remaining previews, as (index, size), then the
     full-resolution strips. Images are prepared in background threads while earlier ones are
     sent."""
@@ -433,7 +446,7 @@ def rest(img, out, send, bar, preview, later, shown, bands, target, offset, pare
 
     for n, _ in later:
         s, data = previews.get()
-        send(data, f"a=T,f=100,i={parent + 1 + n},V=0,{grid},z={1 + n},{below},q=2")
+        send(data, f"a=T,f=100,i={parent + 1 + n},V={top},{grid},z={1 + n},{below},q=2")
         if shown:  # the new preview now covers it
             out.write(wrap(f"{ESC}_Ga=d,d=I,i={shown},q=2{ESC}\\"))
         shown = parent + 1 + n
@@ -443,7 +456,7 @@ def rest(img, out, send, bar, preview, later, shown, bands, target, offset, pare
     for j, (r0, r1, y0, y1) in enumerate(bands):
         data = encoded.get()
         strip_bytes.append(b64(len(data)))
-        send(data, f"a=T,f=100,i={parent + 4 + j},V={r0},X={offset[0]},z=10,{below},q=2")
+        send(data, f"a=T,f=100,i={parent + 4 + j},V={top + r0},X={offset[0]},z=10,{below},q=2")
         bar((len(bands) - j - 1) * sum(strip_bytes) / len(strip_bytes))
     if shown:
         out.write(wrap(f"{ESC}_Ga=d,d=I,i={shown},q=2{ESC}\\"))

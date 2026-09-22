@@ -169,40 +169,46 @@ def test_placeholder_text_is_written_once_with_no_cursor_movement(monkeypatch):
     assert not re.search(r"\x1b\[\d+[AB]", s)
 
 
-def test_later_stages_are_placed_relative_to_the_first_preview(monkeypatch):
-    sent = transmissions(run_show(monkeypatch))
+def test_only_the_bottom_row_is_placeholder_text_and_everything_is_placed_above_it(monkeypatch):
+    # kitty positions a placeholder parent by its topmost row still on screen, so a parent taller
+    # than one row would shift its children once its top scrolled off. The bottom row is the last
+    # to scroll off, so it is the parent, and every stage is placed relative to it.
+    s = run_show(monkeypatch)
+    sent = transmissions(s)
     (parent, _), rest = sent[0], sent[1:]
-    assert parent["U"] == "1" and parent["p"] == "1"
+    assert parent["U"] == "1" and parent["p"] == "1" and parent["r"] == "1"
+    assert s.count("\n", 0, s.index("\x1b[38;2;")) >= 1  # blank rows above the parent's row
     assert all(k["P"] == parent["i"] and k["Q"] == "1" and "U" not in k for k, _ in rest)
     previews = [k for k, _ in rest if "c" in k]
     strips = [k for k, _ in rest if "c" not in k]
-    assert len(previews) == 2 and all(k["c"] == parent["c"] and k["r"] == parent["r"] for k in previews)
-    assert [int(k["V"]) for k in strips][0] == 0 and len(strips) > 1
-    assert sorted(int(k["V"]) for k in strips) == [int(k["V"]) for k in strips]
+    nrows = int(previews[0]["r"])
+    assert len(previews) == 3 and all(k["c"] == parent["c"] and int(k["V"]) == 1 - nrows for k in previews)
+    vs = [int(k["V"]) for k in strips]
+    assert vs[0] == 1 - nrows and vs == sorted(vs) and len(strips) > 1
 
 
-def test_replaced_previews_are_deleted_but_not_the_first(monkeypatch):
+def test_each_preview_is_deleted_once_covered_and_the_last_once_the_strips_are_in(monkeypatch):
     import re
 
     s = run_show(monkeypatch)
     sent = transmissions(s)
     deleted = re.findall(r"_Ga=d,d=I,i=(\d+)", s)
-    assert sorted(deleted) == sorted(k["i"] for k, _ in sent[1:3])
+    assert sorted(deleted) == sorted(k["i"] for k, _ in sent[1:4])
 
 
 def test_previews_have_the_shape_of_the_box_and_strips_their_natural_size(monkeypatch):
     cw, ch = 9.4, 18  # kitty's cells are whole pixels; only a guessed size can be fractional
     sent = transmissions(run_show(monkeypatch, geometry=(213, 57, cw, ch)))
-    for k, (w, h) in sent[:3]:
+    previews, strips = sent[1:4], sent[4:]
+    for k, (w, h) in previews:
         box = int(k["c"]) * cw / (int(k["r"]) * ch)
         assert abs(w / h - box) < 0.01 * box
-    strips = sent[3:]
     width = strips[0][1][0]
     assert all(size[0] == width for _, size in strips)
-    ncols = int(sent[0][0]["c"])
+    ncols, nrows = int(previews[0][0]["c"]), int(previews[0][0]["r"])
     for k, (w, h) in strips:
         assert abs(int(k["X"]) - (ncols * cw - w) / 2) <= 1 and int(k["X"]) < cw
-    assert sum(h for _, (w, h) in strips) == int(sent[0][0]["r"]) * round(ch)
+    assert sum(h for _, (w, h) in strips) == nrows * round(ch)
 
 
 def test_main_detaches_unless_showing_progress(monkeypatch):
@@ -298,8 +304,8 @@ def test_detached_show_measures_the_link_then_leaves_the_rest_to_the_background(
     monkeypatch.setattr(os, "fork", lambda: forks.append(1) or 1)
     s = run_show(monkeypatch, detach=True, reply=lambda image_id: True)
     sent = transmissions(s)
-    assert forks and len(sent) == 2  # the tiny and 1/4 previews, both with replies asked for
-    assert all(k.get("q", "0") == "0" for k, _ in sent)
+    assert forks and len(sent) == 3  # the parent row, then the tiny and 1/4 previews
+    assert all(k.get("q", "0") == "0" for k, _ in sent[1:])  # replies asked for
 
 
 def test_detached_show_stays_in_the_foreground_without_replies(monkeypatch):
@@ -388,7 +394,7 @@ def test_detached_show_with_a_known_rate_returns_without_waiting_for_replies(mon
         raise AssertionError("waited for a reply")
 
     sent = transmissions(run_show(monkeypatch, detach=True, reply=reply))
-    assert forks and len(sent) == 1 and sent[0][0]["q"] == "2"
+    assert forks and len(sent) == 2 and all(k["q"] == "2" for k, _ in sent)
 
 
 def test_detached_show_remembers_the_rate_it_measured(monkeypatch):
@@ -400,3 +406,12 @@ def test_detached_show_remembers_the_rate_it_measured(monkeypatch):
     monkeypatch.setattr(os, "fork", lambda: 1)
     run_show(monkeypatch, detach=True, reply=lambda image_id: True)
     assert load_rate(rate_cache(), "192.0.2.1", now=time.time()) > 0
+
+
+def test_the_parent_row_image_has_the_shape_of_its_row(monkeypatch):
+    # kitty keeps a placeholder image's aspect ratio, centring it in its cells, and places the
+    # stages relative to where it is drawn: a square parent would push them to the right.
+    cw, ch = 9.4, 18
+    (parent, (w, h)), *_ = transmissions(run_show(monkeypatch, geometry=(213, 57, cw, ch)))
+    row = int(parent["c"]) * cw / ch
+    assert abs(w / h - row) < 0.01 * row
