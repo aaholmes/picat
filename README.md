@@ -9,9 +9,10 @@ The image is scaled to fit the terminal window, so no more pixels are sent than 
 
 ![kitten icat and picat side by side, showing the same photo over a 10 Mbit/s link](docs/picat-vs-icat.gif)
 
-picat shows a blurry preview after 0.2 s and a sharp image by 0.8 s; `kitten icat` shows nothing
-until the whole image arrives at 4.1 s. Both ran in kitty 0.32.2 windows of 1000×1400 pixels, with
-their output passed to kitty at 10 Mbit/s, and picat had already measured the link's rate. The
+picat (progressive icat) shows a blurry preview after 0.2 s and a sharp image by 0.8 s; `kitten
+icat` shows nothing until the whole image arrives at 4.1 s. Both ran in kitty 0.32.2 windows of
+1000×1400 pixels, with their output passed to kitty at 10 Mbit/s, and picat had already measured
+the link's rate. The
 photo, of Yosemite National Park, is by
 [Vulturesong](https://commons.wikimedia.org/wiki/File:Yosemite_National_Park_-_HCP_-_October_07,_2022_-_012.jpg)
 and in the public domain (CC0).
@@ -69,3 +70,7 @@ Network Graphics), which first predicts each pixel from its neighbours and compr
 difference; on a smooth generated image that makes the data about a quarter smaller. On the photo
 the prediction does not help, and zlib on raw pixels comes out about 10% smaller than PNG. When an
 image is a PNG that already fits the window, icat sends the file unchanged.
+
+## License
+
+MIT; see [LICENSE](LICENSE).

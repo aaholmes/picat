@@ -5,6 +5,8 @@ description = "Async image display over a slow ssh connection: immediate low-res
 authors = [
     { name = "Adam A Holmes", email = "adamaholmes@gmail.com" }
 ]
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
     "pillow>=12.3.0",
